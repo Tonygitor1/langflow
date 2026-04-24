@@ -6,6 +6,7 @@ from uuid import UUID
 from fastapi import APIRouter, HTTPException
 from lfx.base.models.unified_models import get_model_provider_variable_mapping, validate_model_provider_key
 from sqlalchemy.exc import NoResultFound
+from sqlmodel import select
 
 from langflow.api.utils import CurrentActiveUser, DbSession
 from langflow.api.v1.models import (
@@ -15,8 +16,10 @@ from langflow.api.v1.models import (
     get_provider_from_variable_name,
 )
 from langflow.api.v1.schemas.deployments import DetectVarsRequest, DetectVarsResponse
+from langflow.services.auth import utils as auth_utils
 from langflow.services.database.models.flow_version.crud import get_flow_version_entries_by_ids
-from langflow.services.database.models.variable.model import VariableCreate, VariableRead, VariableUpdate
+from langflow.services.database.models.user.model import User
+from langflow.services.database.models.variable.model import Variable, VariableCreate, VariableRead, VariableUpdate
 from langflow.services.deps import get_variable_service
 from langflow.services.variable.constants import CREDENTIAL_TYPE, GENERIC_TYPE
 from langflow.services.variable.service import DatabaseVariableService
@@ -24,6 +27,13 @@ from langflow.services.variable.service import DatabaseVariableService
 router = APIRouter(prefix="/variables", tags=["Variables"])
 model_provider_variable_mapping = get_model_provider_variable_mapping()
 logger = logging.getLogger(__name__)
+
+# Reserved provider variable names that are always public (except OLLAMA_BASE_URL which is always private).
+# These are variables managed on the Model Providers page.
+_OLLAMA_BASE_URL_VAR = "OLLAMA_BASE_URL"
+RESERVED_PUBLIC_VARS: set[str] = {
+    name for name in model_provider_variable_mapping.values() if name != _OLLAMA_BASE_URL_VAR
+}
 
 
 async def _cleanup_model_list_variable(
@@ -117,6 +127,12 @@ async def create_variable(
     if not variable.value:
         raise HTTPException(status_code=400, detail="Variable value cannot be empty")
 
+    # Reserved provider variables (except Ollama) can only be created by platform admins.
+    if variable.name in RESERVED_PUBLIC_VARS and not current_user.is_superuser:
+        raise HTTPException(
+            status_code=403, detail="Only platform admins can create reserved model provider variables"
+        )
+
     if variable.name in await variable_service.list_variables(user_id=current_user.id, session=session):
         raise HTTPException(status_code=400, detail="Variable name already exists")
 
@@ -131,8 +147,22 @@ async def create_variable(
             except ValueError as e:
                 raise HTTPException(status_code=400, detail=str(e)) from e
 
+    # Determine visibility:
+    #   - Reserved provider vars (not Ollama) → always public (admin already checked above)
+    #   - OLLAMA_BASE_URL → always private (any user can configure)
+    #   - Non-admin users → always private
+    #   - Admin users → respect what they sent (default private)
+    if variable.name in RESERVED_PUBLIC_VARS:
+        determined_visibility = "public"
+    elif variable.name == _OLLAMA_BASE_URL_VAR:
+        determined_visibility = "private"
+    elif current_user.is_superuser:
+        determined_visibility = variable.var_visibility or "private"
+    else:
+        determined_visibility = "private"
+
     try:
-        return await variable_service.create_variable(
+        db_var = await variable_service.create_variable(
             user_id=current_user.id,
             name=variable.name,
             value=variable.value,
@@ -140,6 +170,16 @@ async def create_variable(
             type_=variable.type or CREDENTIAL_TYPE,
             session=session,
         )
+        # Apply determined visibility (service always defaults to "private").
+        if db_var.var_visibility != determined_visibility:
+            db_var.var_visibility = determined_visibility
+            session.add(db_var)
+            await session.flush()
+            await session.refresh(db_var)
+        var_read = VariableRead.model_validate(db_var, from_attributes=True)
+        var_read.is_owner = True
+        var_read.owner_username = None
+        return var_read
     except Exception as e:
         if isinstance(e, HTTPException):
             raise
@@ -154,22 +194,67 @@ async def read_variables(
 ):
     """Read all variables.
 
+    Returns the current user's own variables plus public variables owned by other users.
     Model provider credentials are validated when they are created or updated,
     not on every read. This avoids latency from external API calls on read operations.
-
-    Returns a list of variables.
     """
     variable_service = get_variable_service()
     if not isinstance(variable_service, DatabaseVariableService):
         msg = "Variable service is not an instance of DatabaseVariableService"
         raise TypeError(msg)
     try:
-        all_variables = await variable_service.get_all(user_id=current_user.id, session=session)
+        # Own variables
+        own_variables = await variable_service.get_all(user_id=current_user.id, session=session)
 
         # Filter out internal variables (those starting and ending with __)
-        filtered_variables = [
-            var for var in all_variables if not (var.name and var.name.startswith("__") and var.name.endswith("__"))
+        filtered_variables: list[VariableRead] = [
+            var for var in own_variables if not (var.name and var.name.startswith("__") and var.name.endswith("__"))
         ]
+        for var in filtered_variables:
+            var.is_owner = True
+            var.owner_username = None
+
+        # Public variables from other users
+        public_stmt = select(Variable).where(
+            Variable.var_visibility == "public",
+            Variable.user_id != current_user.id,
+        )
+        public_vars_db = list((await session.exec(public_stmt)).all())
+
+        # Collect owner user IDs to fetch usernames in one query
+        owner_ids = {var.user_id for var in public_vars_db}
+        user_map: dict = {}
+        if owner_ids:
+            users_stmt = select(User).where(User.id.in_(list(owner_ids)))
+            users = list((await session.exec(users_stmt)).all())
+            user_map = {u.id: u.username for u in users}
+
+        # Track names already returned (own vars) to avoid duplicates
+        own_var_names = {var.name for var in filtered_variables}
+
+        for db_var in public_vars_db:
+            # Skip internal variables
+            if db_var.name and db_var.name.startswith("__") and db_var.name.endswith("__"):
+                continue
+            # Skip if user already has their own variable with this name
+            if db_var.name in own_var_names:
+                continue
+            # Decrypt GENERIC type for display
+            value = None
+            if db_var.type == GENERIC_TYPE and db_var.value:
+                try:
+                    value = auth_utils.decrypt_api_key(db_var.value)
+                    if not value:
+                        continue
+                except Exception:  # noqa: BLE001
+                    continue
+
+            var_read = VariableRead.model_validate(db_var, from_attributes=True)
+            if db_var.type == GENERIC_TYPE:
+                var_read.value = value
+            var_read.is_owner = False
+            var_read.owner_username = user_map.get(db_var.user_id)
+            filtered_variables.append(var_read)
 
         # Mark model provider credentials - validation status is based on existence
         # (actual validation happens on create/update)
@@ -203,10 +288,32 @@ async def update_variable(
         msg = "Variable service is not an instance of DatabaseVariableService"
         raise TypeError(msg)
     try:
-        # Get existing variable to check if it's a model provider credential
-        existing_variable = await variable_service.get_variable_by_id(
-            user_id=current_user.id, variable_id=variable_id, session=session
-        )
+        # Fetch the variable directly (without user_id filter) to support cross-user ownership check.
+        raw_stmt = select(Variable).where(Variable.id == variable_id)
+        existing_variable = (await session.exec(raw_stmt)).first()
+        if not existing_variable:
+            raise HTTPException(status_code=404, detail="Variable not found")
+
+        # Non-superusers may only update their own variables.
+        if not current_user.is_superuser and existing_variable.user_id != current_user.id:
+            raise HTTPException(status_code=403, detail="You do not have permission to update this variable")
+
+        # Reserved provider variables (not Ollama) can only be updated by platform admins.
+        if existing_variable.name in RESERVED_PUBLIC_VARS and not current_user.is_superuser:
+            raise HTTPException(
+                status_code=403, detail="Only platform admins can update reserved model provider variables"
+            )
+
+        # Enforce visibility rules:
+        #   - Reserved provider vars (not Ollama) → always public
+        #   - OLLAMA_BASE_URL → always private
+        #   - Non-admin users → strip any visibility change (keep existing)
+        if existing_variable.name in RESERVED_PUBLIC_VARS:
+            variable.var_visibility = "public"
+        elif existing_variable.name == _OLLAMA_BASE_URL_VAR:
+            variable.var_visibility = "private"
+        elif not current_user.is_superuser:
+            variable.var_visibility = None  # Exclude from update — keep existing value
 
         # Validate API key if updating a model provider variable
         if existing_variable.name in model_provider_variable_mapping.values() and variable.value:
@@ -222,12 +329,16 @@ async def update_variable(
                 except ValueError as e:
                     raise HTTPException(status_code=400, detail=str(e)) from e
 
-        return await variable_service.update_variable_fields(
-            user_id=current_user.id,
+        db_var = await variable_service.update_variable_fields(
+            user_id=existing_variable.user_id,
             variable_id=variable_id,
             variable=variable,
             session=session,
         )
+        var_read = VariableRead.model_validate(db_var, from_attributes=True)
+        var_read.is_owner = db_var.user_id == current_user.id
+        var_read.owner_username = None
+        return var_read
     except NoResultFound as e:
         raise HTTPException(status_code=404, detail="Variable not found") from e
     except ValueError as e:
@@ -252,22 +363,38 @@ async def delete_variable(
     """
     variable_service = get_variable_service()
     try:
-        # Get the variable before deleting to check if it's a provider credential
-        variable_to_delete = await variable_service.get_variable_by_id(
-            user_id=current_user.id, variable_id=variable_id, session=session
-        )
+        # Fetch without user_id filter to support ownership check
+        raw_stmt = select(Variable).where(Variable.id == variable_id)
+        variable_to_delete = (await session.exec(raw_stmt)).first()
+        if not variable_to_delete:
+            raise HTTPException(status_code=404, detail="Variable not found")
+
+        # Non-superusers may only delete their own variables.
+        if not current_user.is_superuser and variable_to_delete.user_id != current_user.id:
+            raise HTTPException(status_code=403, detail="You do not have permission to delete this variable")
+
+        # Reserved provider variables (not Ollama) can only be deleted by platform admins.
+        if variable_to_delete.name in RESERVED_PUBLIC_VARS and not current_user.is_superuser:
+            raise HTTPException(
+                status_code=403, detail="Only platform admins can delete reserved model provider variables"
+            )
 
         # Check if this variable is a model provider credential
         provider = get_provider_from_variable_name(variable_to_delete.name)
+        owner_id = variable_to_delete.user_id
 
         # Delete the variable
-        await variable_service.delete_variable_by_id(user_id=current_user.id, variable_id=variable_id, session=session)
+        await variable_service.delete_variable_by_id(
+            user_id=variable_to_delete.user_id, variable_id=variable_id, session=session
+        )
 
         # If this was a provider credential, clean up disabled and enabled models for that provider
         if provider and isinstance(variable_service, DatabaseVariableService):
-            await _cleanup_provider_models(variable_service, current_user.id, provider, session)
+            await _cleanup_provider_models(variable_service, owner_id, provider, session)
 
     except Exception as e:
+        if isinstance(e, HTTPException):
+            raise
         raise HTTPException(status_code=500, detail=str(e)) from e
 
 

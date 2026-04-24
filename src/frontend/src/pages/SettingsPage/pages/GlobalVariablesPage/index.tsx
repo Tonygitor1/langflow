@@ -47,6 +47,25 @@ export default function GlobalVariablesPage() {
       </Dropdown>
     );
   };
+  const VisibilityRenderer = (props) => {
+    const variable = props.data as GlobalVariable;
+    const isPublic = variable?.var_visibility === "public";
+    return (
+      <div className="flex items-center gap-1.5">
+        {isPublic && (
+          <Badge variant="outline" size="md" className="font-normal text-xs">
+            Public
+          </Badge>
+        )}
+        {variable?.owner_username && (
+          <span className="text-xs text-muted-foreground">
+            by {variable.owner_username}
+          </span>
+        )}
+      </div>
+    );
+  };
+
   // Column Definitions: Defines the columns to be displayed.
   const colDefs: ColDef[] = [
     {
@@ -81,6 +100,12 @@ export default function GlobalVariablesPage() {
       valueFormatter: (params) => {
         return params.value?.join(", ") ?? "";
       },
+      flex: 1,
+    },
+    {
+      headerName: "Visibility",
+      field: "var_visibility",
+      cellRenderer: VisibilityRenderer,
       flex: 1,
       resizable: false,
     },
@@ -148,9 +173,12 @@ export default function GlobalVariablesPage() {
 
   async function removeVariables() {
     selectedRows.map(async (row) => {
-      const id = globalVariables?.find((variable) => variable.name === row)?.id;
+      const variable = globalVariables?.find((v) => v.name === row);
+      if (!variable) return;
+      // Only allow deleting own variables
+      if (variable.is_owner === false) return;
       mutateDeleteGlobalVariable(
-        { id },
+        { id: variable.id },
         {
           onError: () => {
             setErrorData({
@@ -164,7 +192,10 @@ export default function GlobalVariablesPage() {
   }
 
   function updateVariables(event: RowClickedEvent<GlobalVariable>) {
-    initialData.current = event.data;
+    const variable = event.data;
+    // Non-owners cannot edit variables from other users
+    if (variable?.is_owner === false) return;
+    initialData.current = variable;
     setOpenModal(true);
   }
 
@@ -201,7 +232,13 @@ export default function GlobalVariablesPage() {
           key={"globalVariables"}
           overlayNoRowsTemplate={t("globalVars.noDataAvailable")}
           onSelectionChanged={(event: SelectionChangedEvent) => {
-            setSelectedRows(event.api.getSelectedRows().map((row) => row.name));
+            // Only allow selecting rows that the current user owns
+            setSelectedRows(
+              event.api
+                .getSelectedRows()
+                .filter((row: GlobalVariable) => row.is_owner !== false)
+                .map((row: GlobalVariable) => row.name),
+            );
           }}
           rowSelection="multiple"
           onRowClicked={updateVariables}

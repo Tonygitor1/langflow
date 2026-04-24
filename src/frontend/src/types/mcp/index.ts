@@ -35,6 +35,9 @@ export type MCPServerInfoType = {
   mode: string | null;
   toolsCount: number | null;
   error?: string;
+  mcp_visibility?: "public" | "private";
+  is_owner?: boolean;
+  owner_username?: string;
 };
 
 export type MCPServerType = {
@@ -44,6 +47,7 @@ export type MCPServerType = {
   args?: string[];
   env?: Record<string, string>;
   headers?: Record<string, string>;
+  mcp_visibility?: "public" | "private";
 };
 
 export type ComposerUrlResponseType = {

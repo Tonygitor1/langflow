@@ -9,4 +9,7 @@ export type GlobalVariable = {
   category?: string;
   is_valid?: boolean | null;
   validation_error?: string | null;
+  var_visibility?: "public" | "private";
+  is_owner?: boolean;
+  owner_username?: string | null;
 };

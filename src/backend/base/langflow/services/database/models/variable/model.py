@@ -20,6 +20,7 @@ class VariableBase(SQLModel):
     value: str = Field(description="Encrypted value of the variable")
     default_fields: list[str] | None = Field(sa_column=Column(JSON))
     type: str | None = Field(None, description="Type of the variable")
+    var_visibility: str = Field(default="private", description="Visibility of the variable: public or private")
 
 
 class Variable(VariableBase, table=True):  # type: ignore[call-arg]
@@ -55,6 +56,9 @@ class VariableRead(SQLModel):
     type: str | None = Field(None, description="Type of the variable")
     value: str | None = Field(None, description="Encrypted value of the variable")
     default_fields: list[str] | None = Field(None, description="Default fields for the variable")
+    var_visibility: str | None = Field(None, description="Visibility of the variable: public or private")
+    is_owner: bool | None = Field(None, description="Whether the current user owns this variable")
+    owner_username: str | None = Field(None, description="Username of the variable owner (for cross-user public vars)")
     validation_error: str | None = Field(
         None, description="Validation error message if this is a model provider credential with an invalid key"
     )
@@ -76,3 +80,4 @@ class VariableUpdate(SQLModel):
     value: str | None = Field(None, description="Encrypted value of the variable")
     default_fields: list[str] | None = Field(None, description="Default fields for the variable")
     type: str | None = Field(None, description="Type of the variable")
+    var_visibility: str | None = Field(None, description="Visibility of the variable: public or private")

@@ -22,6 +22,16 @@ export const useLogout: useMutationFunctionType<undefined, void> = (
   const isAutoLoginEnv = IS_AUTO_LOGIN;
 
   async function logoutUser(): Promise<any> {
+    // If this is a Keycloak SSO session, delegate to the backend OIDC logout
+    // endpoint which clears all cookies and ends the Keycloak session.
+    const isSsoSession = document.cookie
+      .split(";")
+      .some((c) => c.trim().startsWith("sso_provider="));
+    if (isSsoSession) {
+      window.location.assign("/api/v1/login/oidc/logout");
+      return {};
+    }
+
     const autoLogin =
       useAuthStore.getState().autoLogin ||
       getAuthCookie(cookies, LANGFLOW_AUTO_LOGIN_OPTION) === "auto" ||

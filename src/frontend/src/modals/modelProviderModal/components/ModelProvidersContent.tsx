@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import ProviderList from "@/modals/modelProviderModal/components/ProviderList";
 import { Provider } from "@/modals/modelProviderModal/components/types";
+import useAuthStore from "@/stores/authStore";
 import { cn } from "@/utils/utils";
 import { useProviderConfiguration } from "../hooks/useProviderConfiguration";
 import ModelSelection from "./ModelSelection";
@@ -15,6 +16,7 @@ const ModelProvidersContent = ({
   modelType,
   onFlushRef,
 }: ModelProvidersContentProps) => {
+  const isAdmin = useAuthStore((state) => state.isAdmin);
   const [selectedProvider, setSelectedProvider] = useState<Provider | null>(
     null,
   );
@@ -64,6 +66,11 @@ const ModelProvidersContent = ({
     );
   };
 
+  // Ollama is a local per-user install — any user can configure it.
+  // All other providers use centrally managed API keys (admin only).
+  const isOllamaSelected = syncedSelectedProvider?.provider === "Ollama";
+  const canConfigureProvider = isAdmin || isOllamaSelected;
+
   return (
     <div className="flex flex-row w-full h-full overflow-hidden">
       <div
@@ -87,28 +94,36 @@ const ModelProvidersContent = ({
             : "w-0 opacity-0 translate-x-full",
         )}
       >
-        <ProviderConfigurationForm
-          key={syncedSelectedProvider?.provider}
-          selectedProvider={syncedSelectedProvider}
-          providerVariables={providerVariables}
-          variableValues={variableValues}
-          isVariableConfigured={isVariableConfigured}
-          getConfiguredValue={getConfiguredValue}
-          onVariableChange={handleVariableChange}
-          onSave={handleSaveAllVariables}
-          onActivate={handleActivateProvider}
-          onDisconnect={handleDisconnect}
-          isSaving={isSaving}
-          isPending={isPending}
-          isDeleting={isDeleting}
-          isFetchingModels={isFetchingAfterSave}
-          isFetchingAfterDisconnect={isFetchingAfterDisconnect}
-          validationFailed={validationFailed}
-          validationState={validationState}
-          validationError={validationError}
-          canSave={canSave}
-          requiresConfiguration={requiresConfiguration}
-        />
+        {canConfigureProvider ? (
+          <ProviderConfigurationForm
+            key={syncedSelectedProvider?.provider}
+            selectedProvider={syncedSelectedProvider}
+            providerVariables={providerVariables}
+            variableValues={variableValues}
+            isVariableConfigured={isVariableConfigured}
+            getConfiguredValue={getConfiguredValue}
+            onVariableChange={handleVariableChange}
+            onSave={handleSaveAllVariables}
+            onActivate={handleActivateProvider}
+            onDisconnect={handleDisconnect}
+            isSaving={isSaving}
+            isPending={isPending}
+            isDeleting={isDeleting}
+            isFetchingModels={isFetchingAfterSave}
+            isFetchingAfterDisconnect={isFetchingAfterDisconnect}
+            validationFailed={validationFailed}
+            validationState={validationState}
+            validationError={validationError}
+            canSave={canSave}
+            requiresConfiguration={requiresConfiguration}
+          />
+        ) : (
+          <div className="px-4 pt-3 pb-1">
+            <p className="text-xs text-muted-foreground">
+              Provider credentials are configured by your platform admin.
+            </p>
+          </div>
+        )}
 
         <div className="relative flex min-h-0 flex-1 flex-col">
           <div className="flex h-full flex-col gap-3 overflow-y-auto px-4 pt-4 pb-6 transition-all duration-300 ease-in-out">
@@ -123,6 +138,7 @@ const ModelProvidersContent = ({
                   syncedSelectedProvider?.is_configured
                 )
               }
+              readOnly={!canConfigureProvider}
             />
           </div>
           <div className="pointer-events-none absolute inset-x-0 top-0 h-6 bg-gradient-to-b from-background via-background/70 to-transparent" />

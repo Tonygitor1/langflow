@@ -268,8 +268,18 @@ async def get_enabled_providers(
         # Get all variables (VariableRead objects)
         all_variables = await variable_service.get_all(user_id=current_user.id, session=session)
 
-        # Build a set of all variable names we have
-        all_variable_names = {var.name for var in all_variables}
+        # Also include public variables from other users (e.g. admin-managed provider API keys)
+        from langflow.services.database.models.variable.model import Variable as VariableModel
+        from sqlmodel import select as sqlmodel_select
+
+        public_vars_stmt = sqlmodel_select(VariableModel).where(
+            VariableModel.var_visibility == "public",
+            VariableModel.user_id != current_user.id,
+        )
+        public_variables = list((await session.exec(public_vars_stmt)).all())
+
+        # Build a set of all variable names we have (own + public from other users)
+        all_variable_names = {var.name for var in all_variables} | {var.name for var in public_variables}
 
         # Get the provider-variable mapping
         provider_variable_map = get_model_provider_variable_mapping()
@@ -458,6 +468,7 @@ async def _save_model_list_variable(
     current_user: CurrentActiveUser,
     var_name: str,
     model_set: set[str],
+    var_visibility: str = "private",
 ) -> None:
     """Save or update a model list variable.
 
@@ -467,6 +478,7 @@ async def _save_model_list_variable(
         current_user: Current active user
         var_name: Name of the variable to save
         model_set: Set of model names to save
+        var_visibility: Visibility of the variable ("public" for admin, "private" for others)
 
     Raises:
         HTTPException: If there's an error saving the variable
@@ -490,7 +502,13 @@ async def _save_model_list_variable(
             await variable_service.update_variable_fields(
                 user_id=current_user.id,
                 variable_id=existing_var.id,
-                variable=VariableUpdate(id=existing_var.id, name=var_name, value=models_json, type=GENERIC_TYPE),
+                variable=VariableUpdate(
+                    id=existing_var.id,
+                    name=var_name,
+                    value=models_json,
+                    type=GENERIC_TYPE,
+                    var_visibility=var_visibility,
+                ),
                 session=session,
             )
         else:
@@ -499,13 +517,18 @@ async def _save_model_list_variable(
     except ValueError:
         # Variable not found, create new one if there are models
         if model_set:
-            await variable_service.create_variable(
+            db_var = await variable_service.create_variable(
                 user_id=current_user.id,
                 name=var_name,
                 value=models_json,
                 type_=GENERIC_TYPE,
                 session=session,
             )
+            # Set visibility after creation (service always defaults to "private")
+            if db_var.var_visibility != var_visibility:
+                db_var.var_visibility = var_visibility
+                session.add(db_var)
+                await session.flush()
     except HTTPException:
         raise
     except Exception as e:
@@ -542,9 +565,35 @@ async def get_enabled_models(
     configured_providers = {p for p, configured in provider_status.items() if configured}
     replace_with_live_models(all_models_by_provider, current_user.id, configured_providers)
 
-    # Get disabled and explicitly enabled models lists
+    # Get own disabled/enabled model lists
     disabled_models = await _get_disabled_models(session=session, current_user=current_user)
     explicitly_enabled_models = await _get_enabled_models(session=session, current_user=current_user)
+
+    # Merge with admin's public __disabled_models__ / __enabled_models__ (union).
+    # Admin publishes their policy so all users see the same model availability.
+    # The user's own Ollama overrides are unioned on top (they don't conflict in practice
+    # because non-admin can only toggle Ollama models).
+    from langflow.services.database.models.variable.model import Variable as _VarModel
+    from sqlmodel import select as _sel
+
+    for _var_name, _model_set in (
+        (DISABLED_MODELS_VAR, disabled_models),
+        (ENABLED_MODELS_VAR, explicitly_enabled_models),
+    ):
+        _stmt = _sel(_VarModel).where(
+            _VarModel.name == _var_name,
+            _VarModel.var_visibility == "public",
+            _VarModel.user_id != current_user.id,
+        )
+        _public_vars = list((await session.exec(_stmt)).all())
+        for _pv in _public_vars:
+            if _pv.value and (stripped := _pv.value.strip()):
+                try:
+                    _parsed = json.loads(stripped)
+                    if isinstance(_parsed, list):
+                        _model_set.update(str(m) for m in _parsed if isinstance(m, str))
+                except (json.JSONDecodeError, TypeError):
+                    pass
 
     # Build model status based on provider enablement
     enabled_models: dict[str, dict[str, bool]] = {}
@@ -628,7 +677,20 @@ async def update_enabled_models(
             detail=f"Cannot update more than {MAX_BATCH_UPDATE_SIZE} models at once",
         )
 
-    # Get current disabled and explicitly enabled models
+    # Non-admin users can only toggle Ollama models (all other providers are admin-managed).
+    if not current_user.is_superuser:
+        non_ollama = [u for u in updates if u.provider != "Ollama"]
+        if non_ollama:
+            raise HTTPException(
+                status_code=403,
+                detail="Only platform admins can enable/disable non-Ollama models",
+            )
+
+    # Admin's model lists are shared (public) so all users see the same enabled/disabled set.
+    # Non-admin users can only configure Ollama, so their lists stay private.
+    var_visibility = "public" if current_user.is_superuser else "private"
+
+    # Get current disabled and explicitly enabled models (own only — used as the write base)
     disabled_models = await _get_disabled_models(session=session, current_user=current_user)
     explicitly_enabled_models = await _get_enabled_models(session=session, current_user=current_user)
 
@@ -669,10 +731,12 @@ async def update_enabled_models(
         len(updates),
     )
 
-    # Save updated model lists
-    await _save_model_list_variable(variable_service, session, current_user, DISABLED_MODELS_VAR, disabled_models)
+    # Save updated model lists (visibility: public for admin, private for non-admin Ollama users)
     await _save_model_list_variable(
-        variable_service, session, current_user, ENABLED_MODELS_VAR, explicitly_enabled_models
+        variable_service, session, current_user, DISABLED_MODELS_VAR, disabled_models, var_visibility
+    )
+    await _save_model_list_variable(
+        variable_service, session, current_user, ENABLED_MODELS_VAR, explicitly_enabled_models, var_visibility
     )
 
     # Return the updated model status

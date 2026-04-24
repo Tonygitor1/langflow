@@ -1,6 +1,7 @@
 import { useState } from "react";
 import ForwardedIconComponent from "@/components/common/genericIconComponent";
 import ShadTooltip from "@/components/common/shadTooltipComponent";
+import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import {
   DropdownMenu,
@@ -99,75 +100,94 @@ export default function MCPServersPage() {
               </div>
             )}
             <div className="flex flex-col gap-1">
-              {servers.map((server, index) => (
-                <div
-                  key={server.name}
-                  className="flex items-center justify-between rounded-lg px-3 py-2 shadow-sm transition-colors hover:bg-accent"
-                >
-                  <div className="flex items-center gap-2">
-                    <span
-                      className="text-sm font-medium"
-                      data-testid={"mcp_server_name_" + index}
-                    >
-                      {server.name}
-                    </span>
-                    <ShadTooltip content={server.error}>
+              {servers.map((server, index) => {
+                const isOwner = server.is_owner !== false;
+                return (
+                  <div
+                    key={`${server.owner_username ?? "own"}-${server.name}`}
+                    className="flex items-center justify-between rounded-lg px-3 py-2 shadow-sm transition-colors hover:bg-accent"
+                  >
+                    <div className="flex items-center gap-2">
                       <span
-                        className={cn(
-                          "cursor-default select-none !text-mmd text-muted-foreground",
-                          server.error && "text-accent-red-foreground",
-                        )}
+                        className="text-sm font-medium"
+                        data-testid={"mcp_server_name_" + index}
                       >
-                        {server.toolsCount === null
-                          ? server.error
-                            ? server.error.startsWith("Timeout")
-                              ? "Timeout"
-                              : "Error"
-                            : "Loading..."
-                          : !server.toolsCount
-                            ? "No tools found"
-                            : `${server.toolsCount} tool${
-                                server.toolsCount === 1 ? "" : "s"
-                              }`}
+                        {server.name}
                       </span>
-                    </ShadTooltip>
+                      <ShadTooltip content={server.error}>
+                        <span
+                          className={cn(
+                            "cursor-default select-none !text-mmd text-muted-foreground",
+                            server.error && "text-accent-red-foreground",
+                          )}
+                        >
+                          {server.toolsCount === null
+                            ? server.error
+                              ? server.error.startsWith("Timeout")
+                                ? "Timeout"
+                                : "Error"
+                              : "Loading..."
+                            : !server.toolsCount
+                              ? "No tools found"
+                              : `${server.toolsCount} tool${
+                                  server.toolsCount === 1 ? "" : "s"
+                                }`}
+                        </span>
+                      </ShadTooltip>
+                      {server.mcp_visibility === "public" && (
+                        <Badge variant="secondary" className="text-xs px-1.5 py-0">
+                          Public
+                        </Badge>
+                      )}
+                      {!isOwner && server.owner_username && (
+                        <span className="text-xs text-muted-foreground">
+                          by {server.owner_username}
+                        </span>
+                      )}
+                    </div>
+                    {isOwner ? (
+                      <DropdownMenu>
+                        <DropdownMenuTrigger asChild>
+                          <Button
+                            variant="ghost"
+                            size="iconSm"
+                            data-testid={`mcp-server-menu-button-${server.name}`}
+                            className="text-muted-foreground hover:bg-accent"
+                          >
+                            <ForwardedIconComponent
+                              name="Ellipsis"
+                              className="h-5 w-5"
+                            />
+                          </Button>
+                        </DropdownMenuTrigger>
+                        <DropdownMenuContent align="end">
+                          <DropdownMenuItem
+                            onClick={() => handleEdit(server.name)}
+                          >
+                            <ForwardedIconComponent
+                              name="SquarePen"
+                              className="mr-2 h-4 w-4"
+                            />
+                            Edit
+                          </DropdownMenuItem>
+                          <DropdownMenuItem
+                            onClick={() => openDeleteModal(server)}
+                            className="text-destructive"
+                          >
+                            <ForwardedIconComponent
+                              name="Trash2"
+                              className="mr-2 h-4 w-4"
+                            />
+                            Delete
+                          </DropdownMenuItem>
+                        </DropdownMenuContent>
+                      </DropdownMenu>
+                    ) : (
+                      <div className="w-8" />
+                    )}
                   </div>
-                  <DropdownMenu>
-                    <DropdownMenuTrigger asChild>
-                      <Button
-                        variant="ghost"
-                        size="iconSm"
-                        data-testid={`mcp-server-menu-button-${server.name}`}
-                        className="text-muted-foreground hover:bg-accent"
-                      >
-                        <ForwardedIconComponent
-                          name="Ellipsis"
-                          className="h-5 w-5"
-                        />
-                      </Button>
-                    </DropdownMenuTrigger>
-                    <DropdownMenuContent align="end">
-                      <DropdownMenuItem onClick={() => handleEdit(server.name)}>
-                        <ForwardedIconComponent
-                          name="SquarePen"
-                          className="mr-2 h-4 w-4"
-                        />
-                        Edit
-                      </DropdownMenuItem>
-                      <DropdownMenuItem
-                        onClick={() => openDeleteModal(server)}
-                        className="text-destructive"
-                      >
-                        <ForwardedIconComponent
-                          name="Trash2"
-                          className="mr-2 h-4 w-4"
-                        />
-                        Delete
-                      </DropdownMenuItem>
-                    </DropdownMenuContent>
-                  </DropdownMenu>
-                </div>
-              ))}
+                );
+              })}
             </div>
             {editOpen && (
               <AddMcpServerModal

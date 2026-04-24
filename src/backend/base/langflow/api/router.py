@@ -28,6 +28,7 @@ from langflow.api.v1 import (
     variables_router,
 )
 from langflow.api.v1.voice_mode import router as voice_mode_router
+from langflow.api.v1.oidc_sso import router as oidc_sso_router
 from langflow.api.v2 import files_router as files_router_v2
 from langflow.api.v2 import mcp_router as mcp_router_v2
 from langflow.api.v2 import registration_router as registration_router_v2
@@ -61,6 +62,7 @@ router_v1.include_router(users_router)
 router_v1.include_router(api_key_router)
 router_v1.include_router(login_router)
 router_v1.include_router(variables_router)
+router_v1.include_router(oidc_sso_router)
 router_v1.include_router(files_router)
 router_v1.include_router(monitor_router)
 router_v1.include_router(traces_router)

@@ -11,6 +11,7 @@ export interface ModelProviderSelectionProps {
   modelType: "llm" | "embeddings" | "all";
   providerName?: string;
   isEnabledModel?: boolean;
+  readOnly?: boolean;
 }
 
 interface ModelRowProps {
@@ -19,6 +20,7 @@ interface ModelRowProps {
   onToggle: (modelName: string, enabled: boolean) => void;
   testIdPrefix: string;
   isEnabledModel?: boolean;
+  readOnly?: boolean;
 }
 
 /** Single row displaying a model with its toggle switch */
@@ -28,6 +30,7 @@ const ModelRow = ({
   enabled,
   testIdPrefix,
   isEnabledModel,
+  readOnly,
 }: ModelRowProps) => (
   <div className="flex flex-row items-center justify-between h-[24px]">
     <div className="flex flex-row items-center gap-2">
@@ -44,9 +47,10 @@ const ModelRow = ({
     {isEnabledModel && (
       <Switch
         checked={enabled}
-        onCheckedChange={(checked) => onToggle(model.model_name, checked)}
+        onCheckedChange={(checked) => !readOnly && onToggle(model.model_name, checked)}
         data-testid={`${testIdPrefix}-toggle-${model.model_name}`}
         aria-label={`${enabled ? "Disable" : "Enable"} ${model.model_name}`}
+        disabled={readOnly}
         stopPropagation
       />
     )}
@@ -63,6 +67,7 @@ const ModelSelection = ({
   onModelToggle,
   providerName,
   isEnabledModel,
+  readOnly,
 }: ModelProviderSelectionProps) => {
   const { data: enabledModelsData } = useGetEnabledModels();
 
@@ -98,6 +103,7 @@ const ModelSelection = ({
               onToggle={onModelToggle}
               testIdPrefix={testIdPrefix}
               isEnabledModel={isEnabledModel}
+              readOnly={readOnly}
             />
           ))}
         </div>

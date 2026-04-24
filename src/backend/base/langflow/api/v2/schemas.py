@@ -107,6 +107,7 @@ class MCPServerConfig(BaseModel):
     env: dict[str, str] | None = None
     headers: dict[str, str] | None = None
     url: str | None = None
+    mcp_visibility: str | None = None  # 'public' or 'private'; stored separately in DB
 
     model_config = ConfigDict(extra="allow")
 

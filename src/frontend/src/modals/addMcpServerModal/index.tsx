@@ -2,11 +2,13 @@ import { useQueryClient } from "@tanstack/react-query";
 import { nanoid } from "nanoid";
 import { useEffect, useState } from "react";
 import { useLocation } from "react-router-dom";
+import useAuthStore from "@/stores/authStore";
 import { ForwardedIconComponent } from "@/components/common/genericIconComponent";
 import InputListComponent from "@/components/core/parameterRenderComponent/components/inputListComponent";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
+import { Switch } from "@/components/ui/switch";
 import {
   Tabs,
   TabsContent,
@@ -73,6 +75,7 @@ export default function AddMcpServerModal({
       ? [myOpen, mySetOpen]
       : useState(false);
 
+  const isAdmin = useAuthStore((state) => state.isAdmin);
   const location = useLocation();
   const isOnMcpSettingsPage = location.pathname === MCP_SETTINGS_PAGE;
 
@@ -127,6 +130,11 @@ export default function AddMcpServerModal({
     objectToKeyPairRow(initialData?.headers) || [],
   );
 
+  // Visibility state (applies to STDIO and HTTP servers)
+  const [mcpVisibility, setMcpVisibility] = useState<"public" | "private">(
+    initialData?.mcp_visibility || "private",
+  );
+
   useEffect(() => {
     if (open) {
       setType(initialData ? (initialData.command ? "STDIO" : "HTTP") : "JSON");
@@ -140,6 +148,7 @@ export default function AddMcpServerModal({
       setHttpUrl(initialData?.url || "");
       setHttpEnv(objectToKeyPairRow(initialData?.env) || []);
       setHttpHeaders(objectToKeyPairRow(initialData?.headers) || []);
+      setMcpVisibility(initialData?.mcp_visibility || "private");
     }
   }, [open]);
 
@@ -165,6 +174,7 @@ export default function AddMcpServerModal({
           command: stdioCommand,
           args: stdioArgs.filter((a) => a.trim() !== ""),
           env: keyPairRowToObject(stdioEnv),
+          mcp_visibility: mcpVisibility,
         });
         if (!initialData) {
           await queryClient.setQueryData(
@@ -215,6 +225,7 @@ export default function AddMcpServerModal({
           env: keyPairRowToObject(httpEnv),
           url: httpUrl,
           headers: keyPairRowToObject(httpHeaders),
+          mcp_visibility: mcpVisibility,
         });
         if (!initialData) {
           await queryClient.setQueryData(
@@ -430,6 +441,23 @@ export default function AddMcpServerModal({
                       testId="stdio-env"
                     />
                   </div>
+                  {isAdmin && (
+                    <div className="flex items-center justify-between gap-2 pt-2">
+                      <div className="flex flex-col gap-0.5">
+                        <Label className="!text-mmd">Public visibility</Label>
+                        <span className="text-xs text-muted-foreground">
+                          Allow other users to discover this server
+                        </span>
+                      </div>
+                      <Switch
+                        checked={mcpVisibility === "public"}
+                        onCheckedChange={(checked) =>
+                          setMcpVisibility(checked ? "public" : "private")
+                        }
+                        data-testid="stdio-visibility-toggle"
+                      />
+                    </div>
+                  )}
                 </div>
               </TabsContent>
               <TabsContent
@@ -485,6 +513,23 @@ export default function AddMcpServerModal({
                       testId="http-env"
                     />
                   </div>
+                  {isAdmin && (
+                    <div className="flex items-center justify-between gap-2 pt-2">
+                      <div className="flex flex-col gap-0.5">
+                        <Label className="!text-mmd">Public visibility</Label>
+                        <span className="text-xs text-muted-foreground">
+                          Allow other users to discover this server
+                        </span>
+                      </div>
+                      <Switch
+                        checked={mcpVisibility === "public"}
+                        onCheckedChange={(checked) =>
+                          setMcpVisibility(checked ? "public" : "private")
+                        }
+                        data-testid="http-visibility-toggle"
+                      />
+                    </div>
+                  )}
                 </div>
               </TabsContent>
             </div>

@@ -39,6 +39,9 @@ export const usePatchMCPServer: useMutationFunctionType<
       if (body.headers && Object.keys(body.headers).length > 0) {
         payload.headers = body.headers;
       }
+      if (body.mcp_visibility) {
+        payload.mcp_visibility = body.mcp_visibility;
+      }
 
       const res = await api.patch(
         `${getURL("MCP_SERVERS", undefined, true)}/${body.name}`,

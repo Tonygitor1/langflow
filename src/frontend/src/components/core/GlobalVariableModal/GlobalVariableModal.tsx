@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import { ForwardedIconComponent } from "@/components/common/genericIconComponent";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
+import { Switch } from "@/components/ui/switch";
 import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs-button";
 import { PROVIDER_VARIABLE_MAPPING } from "@/constants/providerConstants";
 import { useGetTypes } from "@/controllers/API/queries/flows/use-get-types";
@@ -12,6 +13,7 @@ import {
 } from "@/controllers/API/queries/variables";
 import BaseModal from "@/modals/baseModal";
 import useAlertStore from "@/stores/alertStore";
+import useAuthStore from "@/stores/authStore";
 import getUnavailableFields from "@/stores/globalVariablesStore/utils/get-unavailable-fields";
 import { useTypesStore } from "@/stores/typesStore";
 import type { ResponseErrorDetailAPI } from "@/types/api";
@@ -47,10 +49,14 @@ export default function GlobalVariableModal({
   const [fields, setFields] = useState<string[]>(
     initialData?.default_fields ?? [],
   );
+  const [visibility, setVisibility] = useState<"public" | "private">(
+    initialData?.var_visibility ?? "private",
+  );
   const [open, setOpen] =
     mySetOpen !== undefined && myOpen !== undefined
       ? [myOpen, mySetOpen]
       : useState(false);
+  const isAdmin = useAuthStore((state) => state.isAdmin);
   const setErrorData = useAlertStore((state) => state.setErrorData);
   const componentFields = useTypesStore((state) => state.ComponentFields);
   const { mutate: mutateAddGlobalVariable } = usePostGlobalVariables();
@@ -65,6 +71,7 @@ export default function GlobalVariableModal({
       setValue(initialData.value ?? "");
       setType(initialData.type ?? "Credential");
       setFields(initialData.default_fields ?? []);
+      setVisibility(initialData.var_visibility ?? "private");
     }
   }, [initialData]);
 
@@ -97,11 +104,13 @@ export default function GlobalVariableModal({
       value: string;
       type?: TAB_TYPES;
       default_fields?: string[];
+      var_visibility?: "public" | "private";
     } = {
       name: key,
       type,
       value,
       default_fields: fields,
+      var_visibility: isAdmin ? visibility : "private",
     };
 
     mutateAddGlobalVariable(data, {
@@ -111,6 +120,7 @@ export default function GlobalVariableModal({
         setValue("");
         setType("Credential");
         setFields([]);
+        setVisibility("private");
         setOpen(false);
 
         setSuccessData({
@@ -150,10 +160,12 @@ export default function GlobalVariableModal({
         name: string;
         value?: string;
         default_fields?: string[];
+        var_visibility?: "public" | "private";
       } = {
         id: initialData.id,
         name: key,
         default_fields: fields,
+        var_visibility: isAdmin ? visibility : undefined,
       };
 
       // Only include value if it's been provided (for credentials, empty means unchanged)
@@ -168,6 +180,7 @@ export default function GlobalVariableModal({
           setValue("");
           setType("Credential");
           setFields([]);
+          setVisibility("private");
           setOpen(false);
 
           setSuccessData({
@@ -282,6 +295,24 @@ export default function GlobalVariableModal({
               Selected fields will auto-apply the variable as a default value.
             </div>
           </div>
+
+          {isAdmin && (
+            <div className="flex items-center justify-between rounded-lg border p-3">
+              <div className="space-y-0.5">
+                <Label className="text-sm font-medium">Public</Label>
+                <p className="text-xs text-muted-foreground">
+                  Public variables are visible to all users.
+                </p>
+              </div>
+              <Switch
+                checked={visibility === "public"}
+                onCheckedChange={(checked) =>
+                  setVisibility(checked ? "public" : "private")
+                }
+                data-testid="variable-visibility-switch"
+              />
+            </div>
+          )}
         </div>
       </BaseModal.Content>
       <BaseModal.Footer
