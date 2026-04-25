@@ -2,6 +2,7 @@ import asyncio
 import contextlib
 import gc
 import json
+import os
 import shutil
 import time
 import uuid
@@ -9,6 +10,7 @@ from datetime import datetime, timezone
 from functools import lru_cache
 from pathlib import Path
 
+import boto3
 import chromadb
 import chromadb.errors
 import pandas as pd
@@ -45,7 +47,7 @@ class KBStorageHelper:
     @staticmethod
     @lru_cache
     def get_root_path() -> Path:
-        """Lazy load and return the knowledge bases root directory."""
+        """Lazy load and return the knowledge bases root directory (local metadata storage)."""
         settings = get_settings_service().settings
         knowledge_directory = settings.knowledge_bases_dir
         if not knowledge_directory:
@@ -54,20 +56,24 @@ class KBStorageHelper:
         return Path(knowledge_directory).expanduser()
 
     @staticmethod
-    def get_directory_size(path: Path) -> int:
-        """Calculate the total size of all files in a directory."""
-        total_size = 0
-        try:
-            for file_path in path.rglob("*"):
-                if file_path.is_file():
-                    total_size += file_path.stat().st_size
-        except (OSError, PermissionError):
-            pass
-        return total_size
+    def _is_remote_chroma() -> bool:
+        """Return True when an external Chroma HTTP service is configured."""
+        return bool(os.environ.get("CHROMA_HOST"))
 
     @staticmethod
-    def get_fresh_chroma_client(kb_path: Path) -> chromadb.PersistentClient:
-        """Get a fresh Chroma client with a unique session ID to avoid 'readonly' errors."""
+    def get_chroma_client(kb_path: Path) -> chromadb.ClientAPI:
+        """Return a Chroma client — remote HttpClient when CHROMA_HOST is set, PersistentClient otherwise.
+
+        Remote path: every request is stateless; no shared-memory registry to manage.
+        Local path: clears the SharedSystemClient registry first to avoid 'readonly' errors
+        from stale handles left by a previous request in the same process.
+        """
+        if KBStorageHelper._is_remote_chroma():
+            host = os.environ["CHROMA_HOST"]
+            port = int(os.environ.get("CHROMA_PORT", "8000"))
+            return chromadb.HttpClient(host=host, port=port)
+
+        # Local PersistentClient fallback
         path_key = str(kb_path)
         try:
             if path_key in SharedSystemClient._identifier_to_system:  # noqa: SLF001
@@ -84,9 +90,20 @@ class KBStorageHelper:
             ),
         )
 
+    # Backward-compatible alias used throughout the codebase.
+    get_fresh_chroma_client = get_chroma_client
+
     @staticmethod
     def release_chroma_resources(kb_path: Path) -> None:
-        """Release ChromaDB resources by clearing the registry entry and forcing GC."""
+        """Release ChromaDB resources.
+
+        No-op for the remote HttpClient (no shared state). For PersistentClient,
+        removes the SharedSystemClient registry entry and forces GC to release
+        SQLite file handles.
+        """
+        if KBStorageHelper._is_remote_chroma():
+            return
+
         path_key = str(kb_path)
         try:
             if path_key in SharedSystemClient._identifier_to_system:  # noqa: SLF001
@@ -96,32 +113,73 @@ class KBStorageHelper:
         gc.collect()
 
     @staticmethod
-    def delete_storage(kb_path: Path, kb_name: str) -> bool:
-        """Teardown ChromaDB connections and delete KB directory with retry logic.
+    def get_directory_size(path: Path) -> int:
+        """Calculate the total size of all files in a directory."""
+        total_size = 0
+        try:
+            for file_path in path.rglob("*"):
+                if file_path.is_file():
+                    total_size += file_path.stat().st_size
+        except (OSError, PermissionError):
+            pass
+        return total_size
 
-        Handles ChromaDB SQLite file locks that can prevent deletion, particularly
-        on Windows where mandatory file locks block deletion of open files.
-        Uses retry with exponential backoff and rename-as-fallback strategy.
+    @staticmethod
+    def delete_storage(kb_path: Path, kb_name: str, kb_id: str | None = None) -> bool:
+        """Delete a KB: remote Chroma collection, S3 documents, and local metadata directory.
 
-        Returns:
-            True if deletion succeeded (or path already gone), False otherwise.
+        Args:
+            kb_path:  Local filesystem path to the KB metadata directory.
+            kb_name:  Human-readable KB name (used for local PersistentClient teardown
+                      and fallback collection name).
+            kb_id:    UUID string of the KB (used as the Chroma collection name in
+                      remote mode and as the S3 key prefix).
         """
+        collection_name = kb_id or kb_name
+
+        if KBStorageHelper._is_remote_chroma():
+            # Remote Chroma: delete the collection by its UUID name.
+            try:
+                client = KBStorageHelper.get_chroma_client(kb_path)
+                client.delete_collection(name=collection_name)
+                logger.info("Deleted remote Chroma collection %s", collection_name)
+            except chromadb.errors.ChromaError as e:
+                logger.debug("Remote Chroma collection deletion failed for %s: %s", collection_name, e)
+            except Exception as e:  # noqa: BLE001
+                logger.debug("Unexpected error deleting remote Chroma collection %s: %s", collection_name, e)
+        else:
+            # Local PersistentClient: graceful teardown before rmtree.
+            try:
+                has_data = any((kb_path / m).exists() for m in ["chroma", "chroma.sqlite3", "index"])
+                if has_data:
+                    client = KBStorageHelper.get_chroma_client(kb_path)
+                    chroma = Chroma(client=client, collection_name=kb_name)
+                    with contextlib.suppress(Exception):
+                        chroma.delete_collection()
+                    chroma = None
+                    client = None
+            except (OSError, ValueError, TypeError, chromadb.errors.ChromaError) as e:
+                logger.debug("Collection teardown failed for %s: %s", kb_path.name, e)
+
+        # Delete raw documents from S3 (best-effort).
+        if kb_id:
+            KBStorageHelper._delete_kb_documents_from_s3(kb_id)
+
+        # Delete the local metadata directory.
         if not kb_path.exists():
             return True
 
-        # Teardown ChromaDB collection to release handles
-        try:
-            has_data = any((kb_path / m).exists() for m in ["chroma", "chroma.sqlite3", "index"])
-            if has_data:
-                client = KBStorageHelper.get_fresh_chroma_client(kb_path)
-                chroma = Chroma(client=client, collection_name=kb_name)
-                with contextlib.suppress(Exception):
-                    chroma.delete_collection()
-                chroma = None
-                client = None
-        except (OSError, ValueError, TypeError, chromadb.errors.ChromaError) as e:
-            logger.debug("Collection teardown failed for %s: %s", kb_path.name, e)
+        if KBStorageHelper._is_remote_chroma():
+            # No SQLite lock issues; delete directly.
+            try:
+                shutil.rmtree(kb_path, ignore_errors=False)
+                logger.info("Deleted KB metadata directory %s", kb_name)
+                return not kb_path.exists()
+            except OSError as e:
+                logger.warning("KB metadata deletion failed for %s: %s", kb_name, e)
+                return False
 
+        # Local client: retry with backoff to handle SQLite file locks (mainly Windows).
         gc.collect()
 
         for attempt in range(MAX_DELETE_RETRIES):
@@ -150,7 +208,7 @@ class KBStorageHelper:
                         e,
                     )
 
-        # Last resort: rename for deferred cleanup
+        # Last resort: rename for deferred cleanup.
         if kb_path.exists():
             try:
                 deferred = kb_path.with_name(f".deleted_{kb_name}_{int(time.time())}")
@@ -162,6 +220,82 @@ class KBStorageHelper:
                 return True
 
         return False
+
+    # ── S3 helpers ────────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _s3_key_prefix(user_id: str, kb_id: str) -> str:
+        """Return the S3 key prefix for a KB's documents.
+
+        Layout: <object_storage_prefix>/<user_id>/knowledge_base/<kb_id>/documents
+        Example: data/abc-123/knowledge_base/550e8400-.../documents
+        """
+        prefix = os.environ.get("LANGFLOW_OBJECT_STORAGE_PREFIX", "").rstrip("/")
+        if prefix:
+            return f"{prefix}/{user_id}/knowledge_base/{kb_id}/documents"
+        return f"{user_id}/knowledge_base/{kb_id}/documents"
+
+    @staticmethod
+    def upload_document_to_s3(
+        file_name: str,
+        file_content: bytes,
+        user_id: str,
+        kb_id: str,
+    ) -> str | None:
+        """Upload a raw document file to S3. Returns the S3 key on success, None on failure.
+
+        Files are stored at:
+          s3://<bucket>/<prefix>/<user_id>/knowledge_base/<kb_id>/documents/<file_name>
+        """
+        bucket = os.environ.get("LANGFLOW_OBJECT_STORAGE_BUCKET_NAME")
+        if not bucket:
+            logger.debug("S3 bucket not configured — skipping document upload for %s", file_name)
+            return None
+
+        try:
+            s3_key = f"{KBStorageHelper._s3_key_prefix(user_id, kb_id)}/{file_name}"
+            s3 = boto3.client("s3")
+            s3.put_object(Bucket=bucket, Key=s3_key, Body=file_content)
+            logger.info("Uploaded %s to s3://%s/%s", file_name, bucket, s3_key)
+            return s3_key
+        except Exception as e:  # noqa: BLE001
+            logger.warning("S3 upload failed for %s: %s", file_name, e)
+            return None
+
+    @staticmethod
+    def _delete_kb_documents_from_s3(kb_id: str) -> None:
+        """Delete all S3 objects under the KB documents prefix (best-effort, all users)."""
+        bucket = os.environ.get("LANGFLOW_OBJECT_STORAGE_BUCKET_NAME")
+        if not bucket:
+            return
+
+        try:
+            s3 = boto3.client("s3")
+            # We don't know the user_id at deletion time, so search broadly.
+            # The kb_id is unique so there will be at most one matching prefix per user.
+            search_prefix = os.environ.get("LANGFLOW_OBJECT_STORAGE_PREFIX", "").rstrip("/")
+            # List with a broad prefix — actual user-scoped key will match via /knowledge_base/<kb_id>/
+            broader_prefix = f"{search_prefix}/" if search_prefix else ""
+            # Filter after listing is impractical for large buckets; instead rely on
+            # the fact that kb_id (UUID) is globally unique.
+            kb_prefix = f"{broader_prefix}knowledge_base/{kb_id}/" if not search_prefix else None
+
+            # Build the actual prefix pattern: <prefix>/<any_user>/knowledge_base/<kb_id>/documents/
+            # Since we can't wildcard mid-key, list under the object prefix and filter client-side.
+            paginator = s3.get_paginator("list_objects_v2")
+            # Use the base prefix and filter keys containing the kb_id segment.
+            base_prefix = f"{search_prefix}/" if search_prefix else ""
+            objects_to_delete = []
+            for page in paginator.paginate(Bucket=bucket, Prefix=base_prefix):
+                for obj in page.get("Contents", []):
+                    if f"/knowledge_base/{kb_id}/" in obj["Key"]:
+                        objects_to_delete.append({"Key": obj["Key"]})
+
+            if objects_to_delete:
+                s3.delete_objects(Bucket=bucket, Delete={"Objects": objects_to_delete})
+                logger.info("Deleted %d S3 objects for KB %s", len(objects_to_delete), kb_id)
+        except Exception as e:  # noqa: BLE001
+            logger.warning("S3 cleanup failed for KB %s: %s", kb_id, e)
 
 
 def _remove_sqlite_lock_files(kb_path: Path) -> None:
@@ -216,8 +350,7 @@ class KBAnalysisHelper:
         missing_keys = not all(k in metadata for k in defaults)
         has_unknowns = metadata.get("embedding_provider") == "Unknown" or metadata.get("embedding_model") == "Unknown"
         # Detect stale zero-chunk metadata: the file claims 0 chunks but
-        # Chroma data exists on disk, meaning data was ingested without updating
-        # the metrics (e.g. via the KnowledgeIngestionComponent before the fix).
+        # Chroma data exists on disk (only relevant for local PersistentClient).
         has_chroma_data = any((kb_path / m).exists() for m in ["chroma", "chroma.sqlite3", "index"])
         stale_chunks = metadata.get("chunks", 0) == 0 and has_chroma_data
 
@@ -242,7 +375,8 @@ class KBAnalysisHelper:
             except (OSError, ValueError, TypeError, json.JSONDecodeError) as e:
                 logger.debug(f"Metadata backfill failed for {kb_path}: {e}")
 
-        # Recount metrics from Chroma if metadata claims 0 chunks but data exists
+        # Recount metrics from Chroma if metadata claims 0 chunks but local data exists.
+        # (Only triggered for PersistentClient — remote Chroma won't produce local files.)
         if stale_chunks:
             try:
                 KBAnalysisHelper.update_text_metrics(kb_path, metadata)
@@ -256,12 +390,14 @@ class KBAnalysisHelper:
     @staticmethod
     def update_text_metrics(kb_path: Path, metadata: dict, chroma: Chroma | None = None) -> None:
         """Update text metrics (chunks, words, characters) for a knowledge base."""
+        # Use the KB UUID as the collection name (consistent with ingestion path).
+        kb_id = metadata.get("id") or kb_path.name
         created_locally = chroma is None
         client = None
         try:
             if created_locally:
-                client = KBStorageHelper.get_fresh_chroma_client(kb_path)
-                chroma = Chroma(client=client, collection_name=kb_path.name)
+                client = KBStorageHelper.get_chroma_client(kb_path)
+                chroma = Chroma(client=client, collection_name=kb_id)
 
             if chroma is None:
                 return
@@ -271,7 +407,7 @@ class KBAnalysisHelper:
             if metadata["chunks"] > 0:
                 total_words = 0
                 total_characters = 0
-                # Use a robust batch size to avoid SQLite limits and memory pressure
+                # Use a robust batch size to avoid SQLite limits and memory pressure.
                 batch_size = 5000
 
                 for offset in range(0, metadata["chunks"], batch_size):
@@ -283,7 +419,6 @@ class KBAnalysisHelper:
                     if not results["documents"]:
                         break
 
-                    # Chroma collections always return the text content within the 'documents' field
                     source_chunks = pd.DataFrame({"document": results["documents"]})
                     words, characters = KBAnalysisHelper._calculate_text_metrics(source_chunks, ["document"])
                     total_words += words
@@ -434,8 +569,19 @@ class KBIngestionHelper:
         task_job_id: uuid.UUID,
         job_service: JobService,
     ) -> dict[str, object]:
-        """Orchestrate the ingestion of files into a knowledge base."""
+        """Orchestrate the ingestion of files into a knowledge base.
+
+        Raw files are uploaded to S3 for durable storage before ingestion.
+        Vector embeddings are stored in the configured Chroma service (remote HTTP
+        or local Persistent depending on CHROMA_HOST env var).
+        The Chroma collection is keyed by the KB's UUID (not the human-readable
+        name) so that collections are globally unique in a shared Chroma service.
+        """
         try:
+            metadata = KBAnalysisHelper.get_metadata(kb_path, fast=True)
+            kb_id = metadata.get("id") or kb_name
+            user_id = str(current_user.id)
+
             processed_files = []
             total_chunks_created = 0
 
@@ -447,15 +593,18 @@ class KBIngestionHelper:
 
             embeddings = await KBIngestionHelper._build_embeddings(embedding_provider, embedding_model, current_user)
 
-            client = KBStorageHelper.get_fresh_chroma_client(kb_path)
+            client = KBStorageHelper.get_chroma_client(kb_path)
             chroma = Chroma(
                 client=client,
                 embedding_function=embeddings,
-                collection_name=kb_name,
+                collection_name=kb_id,
             )
 
             job_id_str = str(task_job_id)
             for file_name, file_content in files_data:
+                # Upload raw file to S3 for durable storage (best-effort).
+                KBStorageHelper.upload_document_to_s3(file_name, file_content, user_id, kb_id)
+
                 await logger.ainfo("Starting ingestion of %s for %s", file_name, kb_name)
                 content = extract_text_from_bytes(file_name, file_content)
                 if not content.strip():
@@ -521,11 +670,15 @@ class KBIngestionHelper:
 
         except IngestionCancelledError:
             await logger.awarning(f"Ingestion job {task_job_id} was cancelled. Cleaning up partial data...")
-            await KBIngestionHelper.cleanup_chroma_chunks_by_job(task_job_id, kb_path, kb_name)
+            metadata = KBAnalysisHelper.get_metadata(kb_path, fast=True)
+            kb_id = metadata.get("id") or kb_name
+            await KBIngestionHelper.cleanup_chroma_chunks_by_job(task_job_id, kb_path, kb_name, kb_id=kb_id)
             return {"message": "Job cancelled"}
         except Exception as e:
             await logger.aerror(f"Error in background ingestion: {e!s}. Initiating rollback...")
-            await KBIngestionHelper.cleanup_chroma_chunks_by_job(task_job_id, kb_path, kb_name)
+            metadata = KBAnalysisHelper.get_metadata(kb_path, fast=True)
+            kb_id = metadata.get("id") or kb_name
+            await KBIngestionHelper.cleanup_chroma_chunks_by_job(task_job_id, kb_path, kb_name, kb_id=kb_id)
             raise
         finally:
             client = None
@@ -537,13 +690,26 @@ class KBIngestionHelper:
         job_id: uuid.UUID,
         kb_path: Path,
         kb_name: str,
+        kb_id: str | None = None,
     ) -> None:
-        """Clean up ChromaDB chunks associated with a specific job ID."""
+        """Clean up ChromaDB chunks associated with a specific job ID.
+
+        Args:
+            kb_id: KB UUID string used as the collection name. Falls back to reading
+                   metadata from disk, then to kb_name, if not provided.
+        """
+        if kb_id is None:
+            try:
+                meta = KBAnalysisHelper.get_metadata(kb_path, fast=True)
+                kb_id = meta.get("id") or kb_name
+            except Exception:  # noqa: BLE001
+                kb_id = kb_name
+
         try:
-            client = KBStorageHelper.get_fresh_chroma_client(kb_path)
+            client = KBStorageHelper.get_chroma_client(kb_path)
             chroma = Chroma(
                 client=client,
-                collection_name=kb_name,
+                collection_name=kb_id,
             )
             await chroma.adelete(where={"job_id": str(job_id)})
             await logger.ainfo(f"Cleaned up chunks for job {job_id} in knowledge base '{kb_name}'")

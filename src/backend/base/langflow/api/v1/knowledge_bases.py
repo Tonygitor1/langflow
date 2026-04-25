@@ -104,11 +104,12 @@ async def create_knowledge_base(
         kb_path.mkdir(parents=True, exist_ok=True)
         kb_id = uuid.uuid4()
 
-        # Initialize Chroma storage and collection immediately
-        # This ensures files exist for read operations and avoids 'readonly' errors later
+        # Initialize Chroma collection immediately using the KB UUID as the collection name.
+        # This ensures the collection exists for read operations on both remote (HTTP)
+        # and local (PersistentClient) backends without 'readonly' errors.
         try:
-            client = KBStorageHelper.get_fresh_chroma_client(kb_path)
-            client.create_collection(name=kb_name)
+            client = KBStorageHelper.get_chroma_client(kb_path)
+            client.create_collection(name=str(kb_id))
         except (OSError, ValueError, chromadb.errors.ChromaError) as e:
             logger.warning("Initial Chroma setup for %s failed: %s", kb_name, e)
         finally:
@@ -556,10 +557,15 @@ async def get_knowledge_base_chunks(
     try:
         kb_path = _resolve_kb_path(kb_name, current_user)
 
-        # Guard: If no physical chroma data exists, return empty response immediately
-        # This prevents 'readonly database' errors when trying to initialize Chroma on an empty directory
-        has_data = any((kb_path / m).exists() for m in ["chroma", "chroma.sqlite3", "index"])
-        if not has_data:
+        metadata = KBAnalysisHelper.get_metadata(kb_path, fast=True)
+        kb_id = metadata.get("id") or kb_name
+
+        # Fast path: return empty immediately when metadata says no chunks exist.
+        # For PersistentClient, also guard against missing local Chroma files which
+        # would cause 'readonly database' errors on empty directories.
+        has_local_data = any((kb_path / m).exists() for m in ["chroma", "chroma.sqlite3", "index"])
+        no_data = metadata.get("chunks", 0) == 0 and not has_local_data
+        if no_data:
             return PaginatedChunkResponse(
                 chunks=[],
                 total=0,
@@ -568,11 +574,11 @@ async def get_knowledge_base_chunks(
                 total_pages=0,
             )
 
-        # Create vector store
-        client = KBStorageHelper.get_fresh_chroma_client(kb_path)
+        # Create vector store using the KB UUID as the collection name.
+        client = KBStorageHelper.get_chroma_client(kb_path)
         chroma = Chroma(
             client=client,
-            collection_name=kb_name,
+            collection_name=kb_id,
         )
 
         # Access the raw collection
@@ -642,7 +648,12 @@ async def delete_knowledge_base(kb_name: str, current_user: CurrentActiveUser) -
     try:
         kb_path = _resolve_kb_path(kb_name, current_user)
 
-        if not KBStorageHelper.delete_storage(kb_path, kb_name):
+        # Read the KB UUID so delete_storage can remove the remote Chroma collection
+        # and S3 documents by their UUID-keyed identifiers.
+        metadata = KBAnalysisHelper.get_metadata(kb_path, fast=True)
+        kb_id = metadata.get("id")
+
+        if not KBStorageHelper.delete_storage(kb_path, kb_name, kb_id=kb_id):
             raise HTTPException(
                 status_code=500,
                 detail=f"Failed to delete knowledge base '{kb_name}'. The database may be in use.",
@@ -675,7 +686,9 @@ async def delete_knowledge_bases_bulk(request: BulkDeleteRequest, current_user: 
                 raise  # Re-raise 403 (traversal) and 500 errors
 
             try:
-                if KBStorageHelper.delete_storage(kb_path, kb_name):
+                bulk_meta = KBAnalysisHelper.get_metadata(kb_path, fast=True)
+                bulk_kb_id = bulk_meta.get("id")
+                if KBStorageHelper.delete_storage(kb_path, kb_name, kb_id=bulk_kb_id):
                     deleted_count += 1
             except (OSError, PermissionError) as e:
                 await logger.aexception("Error deleting knowledge base '%s': %s", kb_name, e)
@@ -743,8 +756,10 @@ async def cancel_ingestion(
         # Update status immediately so background task can see it
         await job_service.update_job_status(job.job_id, JobStatus.CANCELLED)
 
-        # Clean up any partially ingested chunks from this job
-        await KBIngestionHelper.cleanup_chroma_chunks_by_job(job.job_id, kb_path, kb_name)
+        # Clean up any partially ingested chunks from this job.
+        cancel_meta = KBAnalysisHelper.get_metadata(kb_path, fast=True)
+        cancel_kb_id = cancel_meta.get("id")
+        await KBIngestionHelper.cleanup_chroma_chunks_by_job(job.job_id, kb_path, kb_name, kb_id=cancel_kb_id)
 
         if revoked:
             message = f"Ingestion job for {job.job_id} cancelled successfully."
