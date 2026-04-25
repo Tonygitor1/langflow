@@ -182,9 +182,19 @@ class DatabaseVariableService(VariableService, Service):
         name: str,
         session: AsyncSession,
     ) -> Variable:
-        # we get the credential from the database
+        # Try the user's own variable first.
         stmt = select(Variable).where(Variable.user_id == user_id, Variable.name == name)
         variable = (await session.exec(stmt)).first()
+
+        if not variable or not variable.value:
+            # Fall back to a public variable with the same name owned by another user
+            # (e.g. platform-admin-managed provider API keys shared with all producers).
+            public_stmt = select(Variable).where(
+                Variable.name == name,
+                Variable.var_visibility == "public",
+                Variable.user_id != user_id,
+            )
+            variable = (await session.exec(public_stmt)).first()
 
         if not variable or not variable.value:
             msg = f"{name} variable not found."
@@ -217,10 +227,23 @@ class DatabaseVariableService(VariableService, Service):
         return variable.value
 
     async def get_all(self, user_id: UUID | str, session: AsyncSession) -> list[VariableRead]:
+        # Own variables.
         stmt = select(Variable).where(Variable.user_id == user_id)
-        variables = list((await session.exec(stmt)).all())
+        own_variables = list((await session.exec(stmt)).all())
+
+        # Public variables from other users (e.g. platform-admin-managed provider API keys).
+        # Excluded when the user already owns a variable with the same name.
+        public_stmt = select(Variable).where(
+            Variable.var_visibility == "public",
+            Variable.user_id != user_id,
+        )
+        public_variables = list((await session.exec(public_stmt)).all())
+
+        own_variable_names = {var.name for var in own_variables}
+
         variables_read = []
-        for variable in variables:
+
+        for variable in own_variables:
             value = None
             if variable.type == GENERIC_TYPE:
                 value = auth_utils.decrypt_api_key(variable.value)
@@ -234,6 +257,15 @@ class DatabaseVariableService(VariableService, Service):
                 variable_read.value = value
 
             variables_read.append(variable_read)
+
+        for variable in public_variables:
+            if variable.name in own_variable_names:
+                # Own variable takes precedence over same-named public variable.
+                continue
+            # value is intentionally left None for CREDENTIAL_TYPE (VariableRead validator handles it).
+            variable_read = VariableRead.model_validate(variable, from_attributes=True)
+            variables_read.append(variable_read)
+
         return variables_read
 
     async def get_all_decrypted_variables(
