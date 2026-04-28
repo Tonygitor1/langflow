@@ -1,12 +1,19 @@
 """Add user_mcp_server table for external MCP server visibility.
 
-This is a merge migration: it runs after ALL current Langflow heads so that our
-custom table is always created last.  If you upgrade Langflow to a newer version
-and new migration heads appear, regenerate this migration (or update
-down_revision to the new heads tuple) so it continues to be last.
+Merge migration: runs after ALL Langflow v1.9.1 heads so there is exactly one
+graph head (c4d5e6f7a8b9) and `alembic upgrade head` (singular) works.
+
+When upgrading to a new Langflow version, update down_revision to the new set
+of heads reported by `alembic heads`.
+
+Langflow v1.9.1 heads:
+  0e6138e7a0c2  add_ondelete_cascade_to_file_user_id_fk
+  1cb603706752  modify_uniqueness_constraint_on_file
+  d306e5c17c41  add_api_key_hash_column_to_apikey_table
+  d37bc4322900  drop_single_constraint_on_files_name
 
 Revision ID: b3c4d5e6f7a8
-Revises: 79e675cb6752, d306e5c17c41
+Revises: 0e6138e7a0c2, 1cb603706752, d306e5c17c41, d37bc4322900
 Create Date: 2026-04-22 00:00:00.000000
 
 """
@@ -17,10 +24,13 @@ import sqlalchemy as sa
 from alembic import op
 
 # revision identifiers, used by Alembic.
-# down_revision is a tuple → merge migration: runs after BOTH Langflow heads.
-# Update this tuple whenever Langflow is upgraded and adds new migration heads.
 revision: str = "b3c4d5e6f7a8"
-down_revision: str | Sequence[str] | None = ("79e675cb6752", "d306e5c17c41")
+down_revision: str | Sequence[str] | None = (
+    "0e6138e7a0c2",  # add_ondelete_cascade_to_file_user_id_fk
+    "1cb603706752",  # modify_uniqueness_constraint_on_file
+    "d306e5c17c41",  # add_api_key_hash_column_to_apikey_table
+    "d37bc4322900",  # drop_single_constraint_on_files_name
+)
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 
