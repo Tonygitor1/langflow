@@ -138,16 +138,25 @@ async def delete_messages(
 
 @router.put("/messages/{message_id}", dependencies=[Depends(get_current_active_user)], response_model=MessageRead)
 async def update_message(
-    message_id: UUID,
+    message_id: str,
     message: MessageUpdate,
     session: DbSession,
     current_user: Annotated[User, Depends(get_current_active_user)],
 ):
+    # Validate the message_id here rather than in the path annotation so that
+    # FastAPI doesn't open (and then abandon) a DB session before validation.
+    # Non-UUID IDs (e.g. from runner containers that have no DB) return 404
+    # just like any other missing message.
+    try:
+        message_uuid = UUID(message_id)
+    except (ValueError, AttributeError):
+        raise HTTPException(status_code=404, detail="Message not found")
+
     try:
         # Fetch is scoped by user ownership. A foreign message ID resolves to
         # None so callers receive the same 404 as a non-existent message.
         # This avoids leaking whether another user's message exists.
-        db_message = await get_message_for_user(session, current_user.id, message_id)
+        db_message = await get_message_for_user(session, current_user.id, message_uuid)
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e)) from e
 

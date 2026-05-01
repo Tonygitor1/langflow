@@ -1,10 +1,12 @@
 import asyncio
 import json
+import os
 import time
 import traceback
 import uuid
 from collections.abc import AsyncIterator
 
+import httpx
 from fastapi import BackgroundTasks, HTTPException, Response
 from lfx.graph.graph.base import Graph
 from lfx.graph.utils import log_vertex_build
@@ -214,6 +216,166 @@ async def create_flow_response(
     )
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# agents-market: optional delegation to the Agent Executor.
+#
+# When LANGFLOW_EXECUTOR_URL is set, generate_flow_events forwards the run to
+# the executor and re-publishes its SSE events onto the local EventManager.
+# This keeps the UI / event_manager / streaming surface unchanged while the
+# actual flow code runs in an isolated container.
+#
+# See 0to1-agents-market/plans/agent_executor.md.
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def _executor_url() -> str | None:
+    raw = os.getenv("LANGFLOW_EXECUTOR_URL")
+    return raw.rstrip("/") if raw else None
+
+
+def _collect_env_secrets() -> dict[str, str]:
+    """Collect whitelisted API-key env vars from the langflow process environment.
+
+    Adjust LANGFLOW_EXECUTOR_SECRET_KEYS to extend the list for a given deployment.
+    """
+    keys_raw = os.getenv(
+        "LANGFLOW_EXECUTOR_SECRET_KEYS",
+        "OPENAI_API_KEY,ANTHROPIC_API_KEY,PINECONE_API_KEY,TAVILY_API_KEY",
+    )
+    keys = [k.strip() for k in keys_raw.split(",") if k.strip()]
+    return {k: os.environ[k] for k in keys if k in os.environ}
+
+
+async def _collect_db_secrets(user_id: str) -> dict[str, str]:
+    """Fetch all global variables for the user from the DB, decrypted.
+
+    Users typically configure API keys via Settings → Global Variables in the
+    Langflow UI. These are stored encrypted in the `variable` table and injected
+    at runtime by the variable service during normal (in-process) flow execution.
+    The runner container has no DB access, so we must collect them here and pass
+    them as env vars in the secrets payload.
+    """
+    from langflow.services.deps import get_variable_service
+
+    variable_service = get_variable_service()
+    if variable_service is None:
+        return {}
+    try:
+        async with session_scope() as session:
+            return await variable_service.get_all_decrypted_variables(user_id, session)
+    except Exception:
+        await logger.awarning("Failed to fetch global variables for executor secrets — continuing without them")
+        return {}
+
+
+async def _delegate_to_executor(
+    *,
+    executor_url: str,
+    flow_id: uuid.UUID,
+    event_manager: EventManager,
+    inputs: InputValueRequest,
+    data: FlowDataRequest | None,
+    files: list[str] | None,
+    stop_component_id: str | None,
+    start_component_id: str | None,
+    current_user: CurrentActiveUser,
+    flow_name: str | None,
+    source_flow_id: uuid.UUID | None,
+) -> None:
+    """POST to the executor and forward each SSE event onto event_manager.queue."""
+
+    # The executor needs the graph payload. If `data` is None, load from DB
+    # (mirrors create_graph in the in-process path).
+    if data is None:
+        async with session_scope() as fresh_session:
+            db_flow_id = source_flow_id if source_flow_id is not None else flow_id
+            row = await fresh_session.exec(select(Flow).where(Flow.id == db_flow_id))
+            flow = row.first()
+            if flow is None or flow.data is None:
+                msg = f"Flow {db_flow_id} not found or has no data"
+                raise HTTPException(status_code=404, detail=msg)
+            graph_data = flow.data
+            resolved_flow_name = flow_name or flow.name
+    else:
+        graph_data = data.model_dump()
+        resolved_flow_name = flow_name
+
+    extra_pip = []
+    if isinstance(graph_data, dict):
+        meta = graph_data.get("metadata") or {}
+        if isinstance(meta, dict):
+            extra_pip = list(meta.get("extra_pip_requirements") or [])
+
+    # Merge secrets: env vars take precedence over DB global variables so that
+    # server-level overrides (e.g. OPENAI_API_KEY set on the host) always win.
+    secrets = await _collect_db_secrets(str(current_user.id))
+    secrets.update(_collect_env_secrets())
+
+    payload = {
+        "flow_id": str(flow_id),
+        "user_id": str(current_user.id),
+        "session_id": getattr(inputs, "session", None) or str(flow_id),
+        "flow_name": resolved_flow_name,
+        "graph_data": graph_data,
+        "inputs": {
+            "input_value": getattr(inputs, "input_value", None),
+            "session": getattr(inputs, "session", None),
+        },
+        "files": files or [],
+        "stop_component_id": stop_component_id,
+        "start_component_id": start_component_id,
+        "extra_pip_requirements": extra_pip,
+        "secrets": secrets,
+    }
+
+    timeout = httpx.Timeout(
+        connect=10.0,
+        read=None,  # SSE stream — read is bounded by executor wall-clock
+        write=10.0,
+        pool=10.0,
+    )
+
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        try:
+            async with client.stream(
+                "POST",
+                f"{executor_url}/runs",
+                json=payload,
+            ) as resp:
+                if resp.status_code >= 400:
+                    body = await resp.aread()
+                    msg = f"executor returned {resp.status_code}: {body.decode('utf-8', errors='replace')[:500]}"
+                    raise HTTPException(status_code=502, detail=msg)
+                async for line in resp.aiter_lines():
+                    if not line or not line.startswith("data:"):
+                        continue
+                    try:
+                        evt = json.loads(line[len("data:"):].strip())
+                    except json.JSONDecodeError:
+                        continue
+                    event_type = evt.get("event")
+                    data_field = evt.get("data", {})
+                    if event_type == "run_id":
+                        # Internal correlation event — log but don't forward.
+                        await logger.adebug(f"executor run_id={data_field.get('run_id')}")
+                        continue
+                    # Forward by calling the matching on_* handler so EventManager
+                    # serializes consistently with the in-process path.
+                    handler_name = f"on_{event_type}"
+                    handler = getattr(event_manager, handler_name, None)
+                    if handler is None or handler is event_manager.noop:
+                        # Unknown event type — fall back to send_event directly.
+                        event_manager.send_event(event_type=event_type, data=data_field)
+                    else:
+                        handler(data=data_field)
+        except httpx.HTTPError as exc:
+            await logger.aexception("executor stream failed")
+            raise HTTPException(status_code=502, detail=f"executor stream failed: {exc}") from exc
+
+    # End-of-stream sentinel for the polling response path.
+    await event_manager.queue.put((None, None, time.time()))
+
+
 async def generate_flow_events(
     *,
     flow_id: uuid.UUID,
@@ -236,10 +398,28 @@ async def generate_flow_events(
     - Processing vertices
     - Handling errors and cleanup
     """
-    chat_service = get_chat_service()
-    telemetry_service = get_telemetry_service()
     if not inputs:
         inputs = InputValueRequest(session=str(flow_id))
+
+    # agents-market: delegate to the executor when configured.
+    executor_url = _executor_url()
+    if executor_url:
+        return await _delegate_to_executor(
+            executor_url=executor_url,
+            flow_id=flow_id,
+            event_manager=event_manager,
+            inputs=inputs,
+            data=data,
+            files=files,
+            stop_component_id=stop_component_id,
+            start_component_id=start_component_id,
+            current_user=current_user,
+            flow_name=flow_name,
+            source_flow_id=source_flow_id,
+        )
+
+    chat_service = get_chat_service()
+    telemetry_service = get_telemetry_service()
 
     async def build_graph_and_get_order() -> tuple[list[str], list[str], Graph]:
         start_time = time.perf_counter()

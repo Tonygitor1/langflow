@@ -234,6 +234,7 @@ async def session_scope() -> AsyncGenerator[AsyncSession, None]:
             raise
         except Exception as e:
             # Actual application/database errors - log at error level
+            print("AAAAAAAA", e)
             await logger.aexception("An error occurred during the session scope.", exception=e)
 
             # Only rollback if session is still in a valid state
