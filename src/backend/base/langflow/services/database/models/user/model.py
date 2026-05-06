@@ -67,6 +67,7 @@ class User(SQLModel, table=True):  # type: ignore[call-arg]
     optins: dict[str, Any] | None = Field(
         sa_column=Column(JSON, default=lambda: UserOptin().model_dump(), nullable=True)
     )
+    synced_llm: bool = Field(default=False, nullable=False)
 
 
 class UserCreate(SQLModel):

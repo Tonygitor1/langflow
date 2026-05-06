@@ -18,111 +18,6 @@ from .provider_queries import _get_all_provider_specific_field_names
 _MODEL_OPTIONS_CACHE_TTL_SECONDS = 30
 
 
-def apply_provider_variable_config_to_build_config(
-    build_config: dict,
-    provider: str,
-) -> dict:
-    """Apply provider variable metadata to component build config fields."""
-    # Resolve helpers via package namespace so tests patching
-    # lfx.base.models.unified_models.<name> keep working.
-    from lfx.base.models import unified_models as unified_models_module
-
-    provider_vars = unified_models_module.get_provider_all_variables(provider)
-
-    """
-    First hides all provider-specific fields (so switching e.g. IBM -> OpenAI
-    does not leave IBM fields visible), then shows and configures only the
-    current provider's fields.
-    """
-    all_provider_fields = _get_all_provider_specific_field_names()
-    for field_name in all_provider_fields:
-        if field_name in build_config:
-            build_config[field_name]["show"] = False
-            build_config[field_name]["required"] = False
-
-    vars_by_field = {}
-    for v in provider_vars:
-        component_meta = v.get("component_metadata", {})
-        mapping_field = component_meta.get("mapping_field")
-        if mapping_field:
-            vars_by_field[mapping_field] = v
-
-    # Apply the current provider's variable metadata to show/configure the right fields and pre-populate credentials.
-    for field_name, var_info in vars_by_field.items():
-        if field_name not in build_config:
-            continue
-
-        field_config = build_config[field_name]
-        component_meta = var_info.get("component_metadata", {})
-
-        # Apply required from component_metadata
-        required = component_meta.get("required", False)
-        field_config["required"] = required
-
-        # Apply advanced from component_metadata
-        advanced = component_meta.get("advanced", False)
-        field_config["advanced"] = advanced
-
-        # Apply info from component_metadata
-        info = component_meta.get("info")
-        if info:
-            field_config["info"] = info
-
-        field_config["show"] = True
-
-        # Pre-populate with the variable name (never the raw secret) when a
-        # credential is available in the database or environment.  Setting
-        # load_from_db=True tells the runtime to resolve the actual value.
-        var_key = var_info.get("variable_key")
-        if var_key:
-            # DropdownInput fields don't support load_from_db because the
-            # variable key name (e.g. "WATSONX_URL") isn't a valid dropdown
-            # option.  These fields are resolved separately by
-            # _resolve_dropdown_provider_values in handle_model_input_update.
-            input_type = field_config.get("_input_type", "")
-            if input_type == "DropdownInput":
-                logger.debug(
-                    "Skipping load_from_db for DropdownInput field %s (will resolve separately)",
-                    field_name,
-                )
-            else:
-                # Decide whether to install this provider's variable key on
-                # the field.  Cases:
-                #
-                # 1. Empty field — auto-populate.
-                # 2. ``load_from_db=True`` with a value that doesn't match
-                #    this provider's ``var_key`` — stale cross-provider
-                #    credential (e.g. ``ANTHROPIC_API_KEY`` left over after
-                #    switching to OpenAI).  Replace with the current
-                #    provider's var_key.
-                # 3. ``load_from_db=True`` with a value that matches
-                #    ``var_key`` — already correct, preserve.
-                # 4. ``load_from_db=False`` with a value — user-typed raw
-                #    credential.  Preserve so it survives refresh cycles.
-                #    We cannot tell from the backend whether a raw value is
-                #    stale after a provider switch, so we err on the side
-                #    of preservation; the user can overwrite it manually.
-                current_value = field_config.get("value")
-                current_load_from_db = field_config.get("load_from_db", False)
-                is_empty = not current_value
-                is_stale_cross_provider_var = current_load_from_db and current_value != var_key
-                if is_empty or is_stale_cross_provider_var:
-                    field_config["value"] = var_key
-                    field_config["load_from_db"] = True
-                    logger.debug(
-                        "Set field %s to var name %s (value resolved at runtime)",
-                        field_name,
-                        var_key,
-                    )
-                else:
-                    logger.debug(
-                        "Skipping auto-set for field %s - user has already supplied a value",
-                        field_name,
-                    )
-
-    return build_config
-
-
 def update_model_options_in_build_config(
     component: Any,
     build_config: dict,
@@ -338,7 +233,6 @@ def handle_model_input_update(
     """Full update_build_config lifecycle for any component with a ModelInput."""
     from lfx.base.models import unified_models as unified_models_module
 
-    # If get_options_func is not provided, use the default based on cache_key_prefix
     if get_options_func is None:
         get_options_func = unified_models_module.get_language_model_options
 
@@ -353,146 +247,36 @@ def handle_model_input_update(
         model_field_name=model_field_name,
     )
 
-    # When the user directly edits a provider-specific field (e.g. api_key),
-    # skip the provider reset/re-population so their value is preserved.
-    provider_mapped_fields = _get_all_provider_mapped_fields()
-    if field_name in provider_mapped_fields:
-        return build_config
-
-    # If the model field is in connection mode (user chose "Connect other models"),
-    # skip auto-selection and provider re-population so credentials stay cleared.
+    # If the model field is in connection mode skip auto-selection logic.
     if build_config.get(model_field_name, {}).get("_connection_mode"):
         return build_config
 
-    # When the user changes the model selection, we need to reset/hide fields that may no longer apply
+    # When the user changes the model selection, validate and update the value.
     if field_name == model_field_name:
         options = build_config[model_field_name].get("options", [])
         build_config[model_field_name]["options"] = options
 
         value_missing = not field_value or field_value[0] not in options
         if value_missing:
-            # If the current value is not in the options (e.g. user switched to a model that
-            # is no longer available), reset to avoid confusion so the user can pick a valid one.
             option_names = {opt["name"] for opt in options}
             value_is_valid = bool(field_value) and field_value[0]["name"] in option_names
-
-            # If the value is invalid, reset to the first option if available, otherwise empty.
             build_config[model_field_name]["value"] = field_value if value_is_valid else [options[0]] if options else ""
             field_value = build_config[model_field_name]["value"]
 
-    # Step 2: Hide all provider-specific fields.  We do NOT clear values
-    # here — the frontend has already mutated ``template[model]["value"]``
-    # to the new selection before POSTing, so the backend can't distinguish
-    # a real provider switch from a same-provider refresh based on the
-    # incoming build_config alone.  Instead,
-    # ``apply_provider_variable_config_to_build_config`` (Step 3) handles
-    # the credential swap by detecting stale cross-provider variable keys
-    # in provider-mapped fields and replacing them with the current
-    # provider's var key.  Raw user-typed values are preserved in all cases.
-    for field in provider_mapped_fields:
-        if field in build_config:
-            field_config = build_config[field]
-            field_config["show"] = False
-            field_config["required"] = False
-
-    # Step 3: Show/configure the right fields for the selected provider
-    # Use field_value when the user actively changed the model selection;
-    # otherwise (initial load with empty field_value, or other field changes)
-    # fall back to the value in build_config (which Step 1 may have set to the default model).
-    current_model_value = (
-        field_value
-        if field_name == model_field_name and field_value
-        else build_config.get(model_field_name, {}).get("value")
-    )
-    if isinstance(current_model_value, list) and len(current_model_value) > 0:
-        provider = current_model_value[0].get("provider", "")
-        if provider:
-            build_config = unified_models_module.apply_provider_variable_config_to_build_config(build_config, provider)
-
-            # Resolve DropdownInput field values from the provider's configured
-            # variables.  load_from_db doesn't work for dropdowns because the
-            # variable key name isn't a valid dropdown option.
-            if hasattr(component, "user_id") and component.user_id:
-                _resolve_dropdown_provider_values(component.user_id, build_config, provider)
-
-        # Also handle WatsonX-specific embedding fields that are not in provider metadata
-        if cache_key_prefix == "embedding_model_options":
-            is_watsonx = provider == "IBM WatsonX"
-            if "truncate_input_tokens" in build_config:
-                build_config["truncate_input_tokens"]["show"] = is_watsonx
-            if "input_text" in build_config:
-                build_config["input_text"]["show"] = is_watsonx
-
-    # Hide and clear the API key field when the selected provider doesn't use one
-    # (e.g. Ollama). ``apply_provider_variable_config_to_build_config`` already
-    # sets ``show=True`` for providers whose metadata maps a variable to the
-    # ``api_key`` field; if it wasn't shown, the provider has no api_key
-    # variable and the previous provider's credential must not leak across
-    # the switch.
-    if "api_key" in build_config and not build_config["api_key"].get("show", False):
-        build_config["api_key"]["value"] = ""
-        build_config["api_key"]["load_from_db"] = False
+    # Sanitize provider-mapped fields that exist in the (possibly stale) build_config
+    # sent by the frontend but are NOT declared as inputs on this component.
+    # This prevents removed fields (e.g. api_key deleted from the Python class)
+    # from showing in the UI.
+    provider_mapped_fields = _get_all_provider_mapped_fields()
+    declared_input_names: set[str] = {
+        getattr(inp, "name", None)
+        for inp in (getattr(component, "inputs", None) or [])
+    }
+    declared_input_names.discard(None)
+    if declared_input_names:
+        for stale_field in provider_mapped_fields:
+            if stale_field in build_config and stale_field not in declared_input_names:
+                build_config[stale_field]["show"] = False
+                build_config[stale_field]["required"] = False
 
     return build_config
-
-
-def _resolve_dropdown_provider_values(
-    user_id,
-    build_config: dict,
-    provider: str,
-) -> None:
-    """Resolve actual values for DropdownInput fields from provider variables.
-
-    DropdownInput fields cannot use the load_from_db mechanism because the
-    variable key name (e.g. ``WATSONX_URL``) is not a valid dropdown option.
-    Instead, we resolve the stored value from the database/environment and
-    set it directly on the field.
-    """
-    from lfx.base.models import unified_models as unified_models_module
-
-    provider_vars = unified_models_module.get_provider_all_variables(provider)
-
-    # Collect dropdown fields that need resolution
-    dropdown_var_keys: dict[str, str] = {}  # var_key -> mapping_field
-    for var_info in provider_vars:
-        component_meta = var_info.get("component_metadata", {})
-        mapping_field = component_meta.get("mapping_field")
-        if not mapping_field or mapping_field not in build_config:
-            continue
-
-        field_config = build_config[mapping_field]
-        if field_config.get("_input_type") != "DropdownInput":
-            continue
-
-        var_key = var_info.get("variable_key")
-        if var_key:
-            dropdown_var_keys[var_key] = mapping_field
-
-    if not dropdown_var_keys:
-        return
-
-    # Resolve all provider variables at once
-    all_vars = unified_models_module.get_all_variables_for_provider(user_id, provider)
-
-    for var_key, field_name in dropdown_var_keys.items():
-        field_config = build_config[field_name]
-        resolved_value = all_vars.get(var_key)
-        if resolved_value:
-            field_config["value"] = resolved_value
-            field_config["load_from_db"] = False
-            logger.debug(
-                "Resolved DropdownInput field %s to %s",
-                field_name,
-                resolved_value,
-            )
-        else:
-            # If we can't resolve, fall back to the first dropdown option
-            options = field_config.get("options", [])
-            if options:
-                field_config["value"] = options[0]
-            field_config["load_from_db"] = False
-            logger.debug(
-                "Could not resolve variable %s for DropdownInput field %s, using default",
-                var_key,
-                field_name,
-            )

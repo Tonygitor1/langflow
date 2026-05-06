@@ -64,6 +64,7 @@ from langflow.services.database.models.auth.sso import SSOConfig, SSOUserProfile
 from langflow.services.database.models.user.crud import get_user_by_username
 from langflow.services.database.models.user.model import User
 from langflow.services.deps import get_auth_service, get_settings_service
+from loguru import logger
 
 router = APIRouter(tags=["SSO"], prefix="/login/oidc")
 
@@ -229,6 +230,185 @@ async def _upsert_sso_profile(
             profile.email = email
         db.add(profile)
     await db.commit()
+
+
+# ── LiteLLM user sync ─────────────────────────────────────────────────────────
+
+
+def _litellm_url() -> str:
+    return os.getenv("LITELLM_URL", "http://localhost:4000").rstrip("/")
+
+
+def _litellm_master_key() -> str:
+    return os.getenv("LITELLM_MASTER_KEY", "")
+
+
+async def _sync_user_to_litellm(db, user: User, username: str) -> None:
+    """Create the user in LiteLLM, generate a key, and store it as LITELLM_KEY variable.
+
+    Skipped for the 'admin' superuser — admin uses the master key directly.
+    """
+    email = username if "@" in username else f"{username}@agents-market.com"
+    base_url = _litellm_url()
+    master_key = _litellm_master_key()
+    auth_headers = {"Authorization": f"Bearer {master_key}", "Content-Type": "application/json"}
+    list_headers = {"x-litellm-api-key": master_key}
+
+    try:
+        async with httpx.AsyncClient(timeout=15) as hc:
+            # Check whether the user already exists in LiteLLM.
+            list_resp = await hc.get(
+                f"{base_url}/user/list",
+                params={"page": 1, "page_size": 25, "user_email": email},
+                headers=list_headers,
+            )
+            litellm_user_id: str | None = None
+            if list_resp.status_code == 200:
+                users = list_resp.json().get("users", [])
+                existing = next((u for u in users if u.get("user_email") == email), None)
+                if existing:
+                    litellm_user_id = existing.get("user_id")
+
+            if litellm_user_id is None:
+                # Create the user in LiteLLM.
+                create_resp = await hc.post(
+                    f"{base_url}/user/new",
+                    json={"auto_create_key": False, "models": ["no-default-models"], "user_email": email, "user_id": str(user.id), "user_role": "internal_user_viewer"},
+                    headers=auth_headers,
+                )
+                create_resp.raise_for_status()
+                litellm_user_id = create_resp.json().get("user_id")
+
+            if not litellm_user_id:
+                logger.warning("LiteLLM did not return a user_id for %s — skipping key generation", username)
+                return
+
+            # Ensure the "default" team exists and add the user to it.
+            team_id: str | None = None
+            team_list_resp = await hc.get(
+                f"{base_url}/v2/team/list",
+                params={"team_alias": "default", "page": 1, "page_size": 10, "sort_by": "created_at", "sort_order": "desc"},
+                headers=auth_headers,
+            )
+            if team_list_resp.status_code == 200:
+                teams = team_list_resp.json().get("teams", [])
+                default_team = next((t for t in teams if t.get("team_alias") == "default"), None)
+                if default_team:
+                    team_id = default_team.get("team_id")
+
+            if team_id is None:
+                create_team_resp = await hc.post(
+                    f"{base_url}/team/new",
+                    json={
+                        "team_alias": "default",
+                        "organization_id": None,
+                        "models": ["all-proxy-models"],
+                        "router_settings": {
+                            "routing_strategy": None,
+                            "allowed_fails": None,
+                            "cooldown_time": None,
+                            "num_retries": None,
+                            "timeout": None,
+                            "retry_after": None,
+                            "fallbacks": None,
+                            "context_window_fallbacks": None,
+                            "retry_policy": None,
+                            "model_group_alias": None,
+                            "enable_tag_filtering": False,
+                            "routing_strategy_args": None,
+                        },
+                    },
+                    headers=auth_headers,
+                )
+                create_team_resp.raise_for_status()
+                team_id = create_team_resp.json().get("team_id")
+                logger.info("Created LiteLLM default team: %s", team_id)
+
+            if team_id:
+                member_resp = await hc.post(
+                    f"{base_url}/team/member_add",
+                    json={
+                        "team_id": team_id,
+                        "member": {
+                            "user_email": email,
+                            "user_id": litellm_user_id,
+                            "role": "user",
+                        },
+                    },
+                    headers=auth_headers,
+                )
+                if member_resp.status_code not in (200, 409):
+                    logger.warning("Unexpected status %s adding %s to default team", member_resp.status_code, username)
+            else:
+                logger.warning("Could not resolve default team id — skipping team membership for %s", username)
+
+            # Generate an API key for the user.
+            key_resp = await hc.post(
+                f"{base_url}/key/generate",
+                json={
+                    "user_id": litellm_user_id,
+                    "team_id": team_id,
+                    "key_alias": email,
+                    "models": ["all-team-models"],
+                    "key_type": "llm_api",
+                    "duration": None,
+                    "metadata": {},
+                },
+                headers=auth_headers,
+            )
+            key_resp.raise_for_status()
+            litellm_key = key_resp.json().get("key", "")
+
+        if not litellm_key:
+            logger.warning("LiteLLM returned empty key for user %s", username)
+            return
+
+        # Store the key as a private Langflow variable called LITELLM_KEY.
+        from langflow.services.deps import get_variable_service
+        from langflow.services.variable.constants import CREDENTIAL_TYPE
+        from langflow.services.variable.service import DatabaseVariableService
+
+        variable_service = get_variable_service()
+        if isinstance(variable_service, DatabaseVariableService):
+            var_name = "LITELLM_KEY"
+            try:
+                existing_var = await variable_service.get_variable_object(
+                    user_id=user.id, name=var_name, session=db
+                )
+                from langflow.services.database.models.variable.model import VariableUpdate
+
+                await variable_service.update_variable_fields(
+                    user_id=user.id,
+                    variable_id=existing_var.id,
+                    variable=VariableUpdate(
+                        id=existing_var.id,
+                        name=var_name,
+                        value=litellm_key,
+                        type=CREDENTIAL_TYPE,
+                        var_visibility="private",
+                    ),
+                    session=db,
+                )
+            except ValueError:
+                db_var = await variable_service.create_variable(
+                    user_id=user.id,
+                    name=var_name,
+                    value=litellm_key,
+                    type_=CREDENTIAL_TYPE,
+                    session=db,
+                )
+                db_var.var_visibility = "private"
+                db.add(db_var)
+                await db.flush()
+
+        # Mark user as synced.
+        user.synced_llm = True
+        db.add(user)
+        await db.commit()
+        logger.info("LiteLLM sync complete for user %s", username)
+
+    except Exception:
+        logger.exception("Failed to sync user %s to LiteLLM — continuing login", username)
 
 
 # ── routes ────────────────────────────────────────────────────────────────────
@@ -411,6 +591,10 @@ async def oidc_callback(
         raise HTTPException(status_code=403, detail="Your account is inactive. Contact a platform administrator.")
 
     await _upsert_sso_profile(db, user_id=str(user.id), provider_name=provider_name, sub_claim=sub_claim, email=email)
+
+    # Sync non-admin users to LiteLLM on first login so they get a personal API key.
+    if username != "admin" and not getattr(user, "synced_llm", False):
+        await _sync_user_to_litellm(db, user, username)
 
     lf_tokens = await auth.create_user_tokens(user_id=user.id, db=db, update_last_login=True)
     auth_settings = get_settings_service().auth_settings

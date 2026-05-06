@@ -197,6 +197,18 @@ def get_lifespan(*, fix_migration=False, version=None):
             await logger.adebug(f"Super user initialized in {asyncio.get_event_loop().time() - current_time:.2f}s")
 
             current_time = asyncio.get_event_loop().time()
+            await logger.adebug("Bootstrapping platform variables")
+            from langflow.initial_setup.bootstrap import bootstrap_platform_variables
+
+            try:
+                await bootstrap_platform_variables()
+            except Exception as e:  # noqa: BLE001
+                await logger.awarning(f"Platform variable bootstrap failed: {e}")
+            await logger.adebug(
+                f"Platform variables bootstrapped in {asyncio.get_event_loop().time() - current_time:.2f}s"
+            )
+
+            current_time = asyncio.get_event_loop().time()
             await logger.adebug("Loading bundles")
             temp_dirs, bundles_components_paths = await load_bundles_with_error_handling()
             get_settings_service().settings.components_path.extend(bundles_components_paths)

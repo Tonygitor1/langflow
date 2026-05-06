@@ -3,7 +3,6 @@ from langchain_core.documents import Document
 
 from lfx.base.datastax.astradb_base import AstraDBBaseComponent
 from lfx.base.models.unified_models import (
-    apply_provider_variable_config_to_build_config,
     get_embedding_model_options,
     get_embeddings,
     update_model_options_in_build_config,
@@ -170,15 +169,6 @@ class AstraDBVectorStoreComponent(AstraDBBaseComponent, LCVectorStoreComponent):
                 field_value=field_value if field_name == "embedding_model" else None,
                 model_field_name="embedding_model",
             )
-
-            # Auto-populate API key based on the selected embedding model's provider.
-            # Skip when user directly edits api_key to preserve their value.
-            if field_name != "api_key":
-                model_value = build_config.get("embedding_model", {}).get("value")
-                if isinstance(model_value, list) and model_value:
-                    provider = model_value[0].get("provider", "")
-                    if provider:
-                        build_config = apply_provider_variable_config_to_build_config(build_config, provider)
 
             # Ensure the API key field is always visible
             if "api_key" in build_config:

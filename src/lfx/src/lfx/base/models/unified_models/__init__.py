@@ -7,7 +7,6 @@ preserving the import surface used across the codebase.
 from .build_config import (
     _MODEL_OPTIONS_CACHE_TTL_SECONDS,
     _get_all_provider_mapped_fields,
-    apply_provider_variable_config_to_build_config,
     handle_model_input_update,
     update_model_options_in_build_config,
 )
@@ -31,13 +30,9 @@ from .model_catalog import (
     normalize_model_names_to_dicts,
 )
 from .provider_queries import (
-    MODELS_DETAILED,
     get_model_provider_metadata,
     get_model_provider_variable_mapping,
-    get_model_providers,
-    get_models_detailed,
     get_provider_all_variables,
-    get_provider_for_model_name,
     get_provider_from_variable_key,
     get_provider_required_variable_keys,
     model_provider_metadata,
@@ -45,12 +40,10 @@ from .provider_queries import (
 
 __all__ = [
     "EMBEDDING_PROVIDER_CLASS_MAPPING",
-    "MODELS_DETAILED",
     "_EMBEDDING_CLASS_IMPORTS",
     "_MODEL_CLASS_IMPORTS",
     "_MODEL_OPTIONS_CACHE_TTL_SECONDS",
     "_get_all_provider_mapped_fields",
-    "apply_provider_variable_config_to_build_config",
     "get_all_variables_for_provider",
     "get_api_key_for_provider",
     "get_embedding_class",
@@ -61,10 +54,7 @@ __all__ = [
     "get_model_class",
     "get_model_provider_metadata",
     "get_model_provider_variable_mapping",
-    "get_model_providers",
-    "get_models_detailed",
     "get_provider_all_variables",
-    "get_provider_for_model_name",
     "get_provider_from_variable_key",
     "get_provider_required_variable_keys",
     "get_unified_models_detailed",
