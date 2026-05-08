@@ -113,6 +113,9 @@ async def get_messages(
             order_col = getattr(MessageTable, order_by).asc()
             stmt = stmt.order_by(order_col)
         messages = await session.exec(stmt)
+        print("MMMMMMMMMMMMSSSSSSSSS")
+        for d in messages:
+            print(d.model_dump())
         return [MessageResponse.model_validate(d, from_attributes=True) for d in messages]
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e)) from e

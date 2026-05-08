@@ -268,6 +268,41 @@ async def _collect_db_secrets(user_id: str) -> dict[str, str]:
         return {}
 
 
+def _server_secret_key() -> str | None:
+    """Return the active langflow Fernet secret used to encrypt DB variables.
+
+    Prefers the value from the running settings service (which auto-generates
+    and persists one in <CONFIG_DIR>/secret_key when LANGFLOW_SECRET_KEY isn't
+    set), falling back to the env var.
+    """
+    try:
+        from langflow.services.deps import get_settings_service
+
+        settings_service = get_settings_service()
+        if settings_service is not None:
+            return settings_service.auth_settings.SECRET_KEY.get_secret_value() or None
+    except Exception:
+        pass
+    return os.getenv("LANGFLOW_SECRET_KEY")
+
+
+def _runner_database_url() -> str | None:
+    """Derive the database URL the runner container should use.
+
+    The langflow server's LANGFLOW_DATABASE_URL points at localhost (or
+    127.0.0.1) in local dev; that won't resolve inside the runner container.
+    Rewrite the host so the runner can reach the same Postgres via Docker's
+    host bridge. LANGFLOW_RUNNER_DATABASE_URL overrides this if set.
+    """
+    override = os.getenv("LANGFLOW_RUNNER_DATABASE_URL")
+    if override:
+        return override
+    raw = os.getenv("LANGFLOW_DATABASE_URL")
+    if not raw:
+        return None
+    return raw.replace("@localhost", "@host.docker.internal").replace("@127.0.0.1", "@host.docker.internal")
+
+
 async def _delegate_to_executor(
     *,
     executor_url: str,
@@ -310,6 +345,20 @@ async def _delegate_to_executor(
     # server-level overrides (e.g. OPENAI_API_KEY set on the host) always win.
     secrets = await _collect_db_secrets(str(current_user.id))
     secrets.update(_collect_env_secrets())
+    # Give the runner the same DB Langflow uses so messages get real UUIDs and
+    # show up in playground history without server-side re-persistence.
+    runner_db_url = _runner_database_url()
+    if runner_db_url:
+        secrets["LANGFLOW_DATABASE_URL"] = runner_db_url
+    # The runner re-queries variable_service.get_variable() for `load_from_db`
+    # fields at component build time, which needs the same Fernet key that
+    # encrypted the value. Without this, the agent receives the raw ciphertext
+    # (gAAAA...) and OpenAI rejects it as an invalid API key.
+    # Pull from the live settings service so we capture the auto-generated key
+    # persisted to <CONFIG_DIR>/secret_key when LANGFLOW_SECRET_KEY isn't set.
+    secret_key = _server_secret_key()
+    if secret_key:
+        secrets["LANGFLOW_SECRET_KEY"] = secret_key
 
     payload = {
         "flow_id": str(flow_id),
