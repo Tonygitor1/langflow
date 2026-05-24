@@ -451,21 +451,21 @@ async def generate_flow_events(
         inputs = InputValueRequest(session=str(flow_id))
 
     # agents-market: delegate to the executor when configured.
-    executor_url = _executor_url()
-    if executor_url:
-        return await _delegate_to_executor(
-            executor_url=executor_url,
-            flow_id=flow_id,
-            event_manager=event_manager,
-            inputs=inputs,
-            data=data,
-            files=files,
-            stop_component_id=stop_component_id,
-            start_component_id=start_component_id,
-            current_user=current_user,
-            flow_name=flow_name,
-            source_flow_id=source_flow_id,
-        )
+    # executor_url = _executor_url()
+    # if executor_url:
+    #     return await _delegate_to_executor(
+    #         executor_url=executor_url,
+    #         flow_id=flow_id,
+    #         event_manager=event_manager,
+    #         inputs=inputs,
+    #         data=data,
+    #         files=files,
+    #         stop_component_id=stop_component_id,
+    #         start_component_id=start_component_id,
+    #         current_user=current_user,
+    #         flow_name=flow_name,
+    #         source_flow_id=source_flow_id,
+    #     )
 
     chat_service = get_chat_service()
     telemetry_service = get_telemetry_service()
