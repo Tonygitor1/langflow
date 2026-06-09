@@ -2,11 +2,14 @@ from __future__ import annotations
 
 import asyncio
 import io
+import logging
+import os
 import threading
 import zipfile
 from typing import Annotated
 from uuid import UUID
 
+import httpx
 import orjson
 from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
 from fastapi.encoders import jsonable_encoder
@@ -563,6 +566,51 @@ async def read_basic_examples(
             raise HTTPException(status_code=500, detail="An internal error occurred while loading examples.") from e
         else:
             return response
+
+
+_logger = logging.getLogger(__name__)
+
+
+@router.post("/{flow_id}/deploy-marketplace", status_code=200)
+async def deploy_to_marketplace(
+    *,
+    session: DbSession,
+    flow_id: UUID,
+    current_user: CurrentActiveUser,
+):
+    """Deploy a flow as a long-lived agent container via the Executor service.
+
+    The executor handles image resolution, docker spawn, port allocation, and
+    health-checking. This route is the Langflow-side proxy so the browser only
+    talks to one origin.
+    """
+    flow = await _read_flow(session, flow_id, current_user.id)
+    if flow is None:
+        raise HTTPException(status_code=404, detail="Flow not found")
+    if not flow.data:
+        raise HTTPException(status_code=422, detail="Flow has no graph data — build it before deploying")
+
+    executor_base = os.getenv("EXECUTOR_BASE_URL", "http://localhost:8013")
+    payload = {
+        "agent_id": str(flow_id),
+        "user_id": str(current_user.id),
+        "flow_id": str(flow_id),
+        "flow_name": flow.name,
+        "graph_data": flow.data,
+    }
+
+    try:
+        async with httpx.AsyncClient(timeout=120.0) as client:
+            resp = await client.post(f"{executor_base}/deploy", json=payload)
+    except httpx.HTTPError as exc:
+        _logger.exception("executor /deploy unreachable for flow %s", flow_id)
+        raise HTTPException(status_code=502, detail=f"executor unreachable: {exc}") from exc
+
+    if resp.status_code >= 400:
+        _logger.error("executor returned %s for flow %s: %s", resp.status_code, flow_id, resp.text[:500])
+        raise HTTPException(status_code=resp.status_code, detail=resp.text[:500])
+
+    return resp.json()
 
 
 @router.post("/expand/", status_code=200, dependencies=[Depends(get_current_active_user)], include_in_schema=False)

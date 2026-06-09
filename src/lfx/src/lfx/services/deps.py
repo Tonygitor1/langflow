@@ -222,7 +222,8 @@ async def session_scope() -> AsyncGenerator[AsyncSession, None]:
         try:
             yield session
             await session.commit()
-        except HTTPException:
+        except HTTPException as e:
+            print("BBBBBBBBBBBB", e)
             # HTTPExceptions are control flow in FastAPI (returning 4xx/5xx responses),
             # not actual errors. Don't log them - FastAPI's exception handlers will
             # take care of the HTTP response. Just rollback any uncommitted changes.
