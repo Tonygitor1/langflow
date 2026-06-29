@@ -16,6 +16,7 @@ from fastapi.encoders import jsonable_encoder
 from fastapi_pagination import Page, Params
 from fastapi_pagination.ext.sqlmodel import apaginate
 from lfx.services.cache.utils import CACHE_MISS
+from pydantic import BaseModel, Field
 from sqlmodel import and_, col, select
 
 from langflow.api.utils import (
@@ -571,12 +572,32 @@ async def read_basic_examples(
 _logger = logging.getLogger(__name__)
 
 
+class DeployMarketplaceBody(BaseModel):
+    """A2A AgentCard configuration — required for marketplace deployment."""
+
+    a2a_config: A2AMarketplaceConfig
+
+
+class A2AMarketplaceConfig(BaseModel):
+    name: str
+    description: str = ""
+    version: str = "1.0.0"
+    capabilities: dict = Field(default_factory=lambda: {"streaming": True})
+    authentication: dict = Field(default_factory=lambda: {"schemes": []})
+    defaultInputModes: list[str] = Field(default_factory=lambda: ["text"])
+    defaultOutputModes: list[str] = Field(default_factory=lambda: ["text"])
+    skills: list[dict] = Field(default_factory=list)
+    provider: dict | None = None
+    documentationUrl: str | None = None
+
+
 @router.post("/{flow_id}/deploy-marketplace", status_code=200)
 async def deploy_to_marketplace(
     *,
     session: DbSession,
     flow_id: UUID,
     current_user: CurrentActiveUser,
+    body: DeployMarketplaceBody,
 ):
     """Deploy a flow as a long-lived agent container via the Executor service.
 
@@ -597,6 +618,7 @@ async def deploy_to_marketplace(
         "flow_id": str(flow_id),
         "flow_name": flow.name,
         "graph_data": flow.data,
+        "a2a_config": body.a2a_config.model_dump(),
     }
 
     try:
