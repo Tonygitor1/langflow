@@ -274,22 +274,90 @@ async def read_docx_file_async(file_path: str) -> str:
             Path(temp_path).unlink()
 
 
+def _extract_pdf_text_pypdf(file_content: bytes) -> str | None:
+    """Extract text from a PDF using pypdf, trying multiple extraction modes.
+
+    Returns the extracted text, or None if pypdf cannot extract meaningful text.
+    """
+    import logging
+
+    logger = logging.getLogger(__name__)
+    try:
+        with BytesIO(file_content) as f, PdfReader(f) as reader:
+            # Try default/layout mode first
+            for mode in (None, "plain", "layout"):
+                try:
+                    pages_text = []
+                    for page in reader.pages:
+                        text = page.extract_text(extraction_mode=mode) if mode else page.extract_text()
+                        pages_text.append(text or "")
+                    result = "\n\n".join(pages_text)
+                    if result.strip():
+                        logger.debug("pypdf extracted %d chars with mode=%s", len(result), mode or "default")
+                        return result
+                except Exception:
+                    continue
+            # All modes failed to produce meaningful text
+            return None
+    except Exception:
+        return None
+
+
+def _extract_pdf_text_pdfminer(file_content: bytes) -> str | None:
+    """Extract text from a PDF using pdfminer.six (fallback when pypdf fails).
+
+    Returns the extracted text, or None if pdfminer is not available or fails.
+    """
+    import logging
+
+    logger = logging.getLogger(__name__)
+    try:
+        from pdfminer.high_level import extract_text as pdfminer_extract
+
+        with BytesIO(file_content) as f:
+            result = pdfminer_extract(f)
+            if result.strip():
+                logger.debug("pdfminer.six extracted %d chars", len(result))
+                return result
+    except ImportError:
+        logger.debug("pdfminer.six not installed — cannot use as PDF fallback")
+    except Exception:
+        logger.debug("pdfminer.six extraction failed", exc_info=True)
+    return None
+
+
 def extract_text_from_bytes(file_name: str, file_content: bytes) -> str:
     """Extract text from binary file content based on file extension.
 
-    Supports PDF (via pypdf), DOCX (via python-docx), and plain text files.
+    Supports PDF (via pypdf, with pdfminer.six fallback), DOCX (via
+    python-docx), and plain text files.
 
     Raises:
         ValueError: If the file content is corrupted or cannot be parsed.
     """
+    import logging
+
+    logger = logging.getLogger(__name__)
     lower_name = file_name.lower()
     if lower_name.endswith(".pdf"):
-        try:
-            with BytesIO(file_content) as f, PdfReader(f) as reader:
-                return "\n\n".join(page.extract_text() or "" for page in reader.pages)
-        except Exception as e:
-            msg = f"Failed to parse PDF file '{file_name}': {e}"
-            raise ValueError(msg) from e
+        # Try pypdf first (already a dependency)
+        result = _extract_pdf_text_pypdf(file_content)
+        if result is not None:
+            return result
+
+        # pypdf failed — try pdfminer.six as a more robust fallback
+        logger.info("pypdf could not extract text from %s — trying pdfminer.six", file_name)
+        result = _extract_pdf_text_pdfminer(file_content)
+        if result is not None:
+            return result
+
+        # Both extractors failed — raise a clear error
+        msg = (
+            f"Could not extract text from PDF '{file_name}'. "
+            "The PDF may be image-based (scanned) or use unsupported font encodings. "
+            "Try installing pdfminer.six for better extraction: pip install pdfminer.six"
+        )
+        raise ValueError(msg)
     if lower_name.endswith(".docx"):
         try:
             from docx import Document
