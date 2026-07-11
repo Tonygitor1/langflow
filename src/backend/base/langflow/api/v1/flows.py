@@ -635,6 +635,33 @@ async def deploy_to_marketplace(
     return resp.json()
 
 
+@router.get("/{flow_id}/deployment-status", status_code=200)
+async def get_deployment_status(
+    *,
+    flow_id: UUID,
+    current_user: CurrentActiveUser,  # noqa: ARG001 — gates the route to authenticated users
+):
+    """Return the deployment status of a flow (proxy to the Executor).
+
+    The browser only talks to Langflow, so this proxies the executor's
+    GET /deploy/{agent_id} (agent_id == flow_id). Returns {"status":
+    "not_deployed"} when the flow was never published.
+    """
+    executor_base = os.getenv("EXECUTOR_BASE_URL", "http://localhost:8013")
+    try:
+        async with httpx.AsyncClient(timeout=20.0) as client:
+            resp = await client.get(f"{executor_base}/deploy/{flow_id}")
+    except httpx.HTTPError as exc:
+        _logger.warning("executor deploy-status unreachable for flow %s: %s", flow_id, exc)
+        return {"status": "unknown", "detail": "executor unreachable"}
+
+    if resp.status_code == 404:
+        return {"status": "not_deployed"}
+    if resp.status_code >= 400:
+        raise HTTPException(status_code=resp.status_code, detail=resp.text[:500])
+    return resp.json()
+
+
 @router.post("/expand/", status_code=200, dependencies=[Depends(get_current_active_user)], include_in_schema=False)
 async def expand_compact_flow_endpoint(
     compact_data: dict,
