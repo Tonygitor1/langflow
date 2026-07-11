@@ -445,6 +445,74 @@ async def _sync_user_to_litellm(db, user: User, username: str) -> None:
         logger.exception("Failed to sync user %s to LiteLLM — continuing login", username)
 
 
+async def find_or_create_sso_user(
+    db,
+    *,
+    sub_claim: str,
+    username: str,
+    email: str | None,
+    is_platform_admin: bool,
+    provider_name: str,
+    sync_litellm: bool = True,
+) -> User:
+    """Find or create a Langflow User for an external SSO identity.
+
+    Shared by the browser OIDC callback (oidc_callback below) and the
+    internal POST /variables/internal/ensure-user endpoint, which the
+    executor calls to lazily provision consumer users who are blocked
+    from ever logging into the builder (see _ALLOWED_ROLES) and so would
+    otherwise never get a Langflow User row or a LITELLM_KEY.
+    """
+    auth = get_auth_service()
+
+    # Primary: resolve via SSOUserProfile (stable sub → Langflow user.id link).
+    result = await db.exec(
+        select(SSOUserProfile).where(
+            SSOUserProfile.sso_provider == provider_name,
+            SSOUserProfile.sso_user_id == sub_claim,
+        )
+    )
+    sso_profile = result.first()
+
+    user: User | None = None
+    if sso_profile is not None:
+        user = await db.get(User, sso_profile.user_id)
+        if user is None:
+            sso_profile = None
+
+    if user is None:
+        user = await get_user_by_username(db, username)
+
+    if user is None:
+        user = User(
+            username=username,
+            # Random password — SSO users never authenticate with it directly.
+            password=auth.get_password_hash(secrets.token_urlsafe(32)),
+            is_active=True,
+            is_superuser=is_platform_admin,
+        )
+        db.add(user)
+        await db.commit()
+        await db.refresh(user)
+        await get_or_create_default_folder(db, user.id)
+    elif user.is_superuser != is_platform_admin:
+        user.is_superuser = is_platform_admin
+        db.add(user)
+        await db.commit()
+        await db.refresh(user)
+
+    if not user.is_active:
+        raise HTTPException(status_code=403, detail="Your account is inactive. Contact a platform administrator.")
+
+    await _upsert_sso_profile(db, user_id=str(user.id), provider_name=provider_name, sub_claim=sub_claim, email=email)
+
+    # Sync non-admin users to LiteLLM on first login so they get a personal API key.
+    if sync_litellm and username != "admin" and not getattr(user, "synced_llm", False):
+        await _sync_user_to_litellm(db, user, username)
+
+    return user
+
+
 # ── routes ────────────────────────────────────────────────────────────────────
 
 
@@ -600,50 +668,14 @@ async def oidc_callback(
     is_platform_admin = "platform_admin" in realm_roles
     auth = get_auth_service()
 
-    # Primary: resolve via SSOUserProfile (stable sub → Langflow user.id link).
-    result = await db.exec(
-        select(SSOUserProfile).where(
-            SSOUserProfile.sso_provider == provider_name,
-            SSOUserProfile.sso_user_id == sub_claim,
-        )
+    user = await find_or_create_sso_user(
+        db,
+        sub_claim=sub_claim,
+        username=username,
+        email=email,
+        is_platform_admin=is_platform_admin,
+        provider_name=provider_name,
     )
-    sso_profile = result.first()
-
-    user: User | None = None
-    if sso_profile is not None:
-        user = await db.get(User, sso_profile.user_id)
-        if user is None:
-            sso_profile = None
-
-    if user is None:
-        user = await get_user_by_username(db, username)
-
-    if user is None:
-        user = User(
-            username=username,
-            # Random password — SSO users never authenticate with it directly.
-            password=auth.get_password_hash(secrets.token_urlsafe(32)),
-            is_active=True,
-            is_superuser=is_platform_admin,
-        )
-        db.add(user)
-        await db.commit()
-        await db.refresh(user)
-        await get_or_create_default_folder(db, user.id)
-    elif user.is_superuser != is_platform_admin:
-        user.is_superuser = is_platform_admin
-        db.add(user)
-        await db.commit()
-        await db.refresh(user)
-
-    if not user.is_active:
-        raise HTTPException(status_code=403, detail="Your account is inactive. Contact a platform administrator.")
-
-    await _upsert_sso_profile(db, user_id=str(user.id), provider_name=provider_name, sub_claim=sub_claim, email=email)
-
-    # Sync non-admin users to LiteLLM on first login so they get a personal API key.
-    if username != "admin" and not getattr(user, "synced_llm", False):
-        await _sync_user_to_litellm(db, user, username)
 
     lf_tokens = await auth.create_user_tokens(user_id=user.id, db=db, update_last_login=True)
     auth_settings = get_settings_service().auth_settings

@@ -318,7 +318,7 @@ backend_local:
 		--reload-exclude ".venv/*" \
 		--reload-exclude "__pycache__/*" \
 		--reload-exclude "node_modules/*" \
-		--loop asyncio \
+		--loop asyncio
 
 build_and_run: setup_env ## build the project and run it
 	$(call CLEAR_DIRS,dist src/backend/base/dist)
