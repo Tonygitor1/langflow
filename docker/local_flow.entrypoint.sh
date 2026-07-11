@@ -49,27 +49,44 @@ done
 if [ -f "$FLOW_SNAPSHOT_PATH" ]; then
     echo "[entrypoint] Importing flow snapshot from ${FLOW_SNAPSHOT_PATH} ..."
 
-    # Authenticate
-    LANGFLOW_USER="${LANGFLOW_SUPERUSER:-admin}"
-    LANGFLOW_PASS="${LANGFLOW_SUPERUSER_PASSWORD:-admin}"
+    # Authenticate. When LANGFLOW_AUTO_LOGIN=true (always the case for this
+    # deployment target), Langflow force-overrides the superuser credentials
+    # to "langflow"/"langflow" (DEFAULT_SUPERUSER/DEFAULT_SUPERUSER_PASSWORD
+    # in lfx/services/settings/auth.py's validate_superuser) — any
+    # LANGFLOW_SUPERUSER*/env override is silently ignored in that mode, so
+    # the fallback here must match that forced default, not a generic guess.
+    LANGFLOW_USER="${LANGFLOW_SUPERUSER:-langflow}"
+    LANGFLOW_PASS="${LANGFLOW_SUPERUSER_PASSWORD:-langflow}"
 
-    LOGIN_RESP=$(curl -sf -X POST "http://${LANGFLOW_HOST}:${LANGFLOW_PORT}/api/v1/login" \
+    # -w appends "\n<status>" so we can tell a real failure from an empty
+    # body, instead of -f swallowing the response and hiding why it failed.
+    LOGIN_HTTP=$(curl -s -w "\n%{http_code}" -X POST "http://${LANGFLOW_HOST}:${LANGFLOW_PORT}/api/v1/login" \
         -H "Content-Type: application/x-www-form-urlencoded" \
-        -d "username=${LANGFLOW_USER}&password=${LANGFLOW_PASS}") || {
-        echo "[entrypoint] WARNING: Failed to authenticate. Continuing without flow import."
-    }
+        -d "username=${LANGFLOW_USER}&password=${LANGFLOW_PASS}")
+    LOGIN_STATUS="${LOGIN_HTTP##*$'\n'}"
+    LOGIN_RESP="${LOGIN_HTTP%$'\n'*}"
+
+    if [ "$LOGIN_STATUS" != "200" ]; then
+        echo "[entrypoint] WARNING: Failed to authenticate (HTTP ${LOGIN_STATUS}): ${LOGIN_RESP}"
+        LOGIN_RESP=""
+    fi
 
     if [ -n "${LOGIN_RESP:-}" ]; then
         ACCESS_TOKEN=$(echo "$LOGIN_RESP" | python3 -c "import sys,json; print(json.load(sys.stdin).get('access_token',''))" 2>/dev/null || true)
 
         if [ -n "${ACCESS_TOKEN:-}" ]; then
             # Import the flow
-            IMPORT_RESP=$(curl -sf -X POST "http://${LANGFLOW_HOST}:${LANGFLOW_PORT}/api/v1/flows/" \
+            IMPORT_HTTP=$(curl -s -w "\n%{http_code}" -X POST "http://${LANGFLOW_HOST}:${LANGFLOW_PORT}/api/v1/flows/" \
                 -H "Authorization: Bearer ${ACCESS_TOKEN}" \
                 -H "Content-Type: application/json" \
-                -d "@${FLOW_SNAPSHOT_PATH}") || {
-                echo "[entrypoint] WARNING: Failed to import flow snapshot."
-            }
+                -d "@${FLOW_SNAPSHOT_PATH}")
+            IMPORT_STATUS="${IMPORT_HTTP##*$'\n'}"
+            IMPORT_RESP="${IMPORT_HTTP%$'\n'*}"
+
+            if [ "$IMPORT_STATUS" != "200" ] && [ "$IMPORT_STATUS" != "201" ]; then
+                echo "[entrypoint] WARNING: Failed to import flow snapshot (HTTP ${IMPORT_STATUS}): ${IMPORT_RESP}"
+                IMPORT_RESP=""
+            fi
 
             if [ -n "${IMPORT_RESP:-}" ]; then
                 FLOW_ID=$(echo "$IMPORT_RESP" | python3 -c "import sys,json; print(json.load(sys.stdin).get('id',''))" 2>/dev/null || true)

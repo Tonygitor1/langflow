@@ -493,6 +493,14 @@ async def _run_flow_internal(
             context = context.copy()  # Don't modify the original context
             context["request_variables"] = request_variables
 
+    # When invoked through the agent executor proxy, the invoking user's own
+    # LITELLM_KEY is forwarded as X-LANGFLOW-GLOBAL-VAR-LITELLM_KEY so the
+    # flow's model calls are billed to that user, not a shared key. Publish it
+    # request-scoped for _get_litellm_credentials to pick up (top priority).
+    from lfx.base.models.unified_models.model_catalog import set_forwarded_litellm_key
+
+    set_forwarded_litellm_key(request_variables.get("LITELLM_KEY") if request_variables else None)
+
     start_time = time.perf_counter()
 
     if stream:
