@@ -4,8 +4,19 @@ import { api } from "../../api";
 import { getURL } from "../../helpers/constants";
 import { UseRequestProcessor } from "../../services/request-processor";
 
+export interface MarketplaceMetadata {
+  name: string;
+  producer: string;
+  description: string;
+  category: string;
+  price: number;
+  price_unit: "month" | "task" | "one-time";
+  tags: string[];
+}
+
 interface IDeployMarketplace {
   flowId: string;
+  metadata: MarketplaceMetadata;
 }
 
 export interface DeployMarketplaceResponse {
@@ -26,6 +37,7 @@ export const usePostDeployMarketplace: useMutationFunctionType<
   ): Promise<DeployMarketplaceResponse> => {
     const response = await api.post(
       `${getURL("FLOWS")}/${payload.flowId}/deploy-marketplace`,
+      { metadata: payload.metadata },
     );
     return response.data;
   };
