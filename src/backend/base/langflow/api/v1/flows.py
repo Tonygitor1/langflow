@@ -577,12 +577,15 @@ async def deploy_to_marketplace(
     session: DbSession,
     flow_id: UUID,
     current_user: CurrentActiveUser,
+    body: dict | None = None,
 ):
     """Deploy a flow as a long-lived agent container via the Executor service.
 
     The executor handles image resolution, docker spawn, port allocation, and
     health-checking. This route is the Langflow-side proxy so the browser only
-    talks to one origin.
+    talks to one origin. The optional body carries marketplace listing metadata
+    ({"metadata": {name, producer, description, category, price, ...}}) that
+    the executor stores alongside the deployment.
     """
     flow = await _read_flow(session, flow_id, current_user.id)
     if flow is None:
@@ -597,6 +600,7 @@ async def deploy_to_marketplace(
         "flow_id": str(flow_id),
         "flow_name": flow.name,
         "graph_data": flow.data,
+        "metadata": (body or {}).get("metadata"),
     }
 
     try:
