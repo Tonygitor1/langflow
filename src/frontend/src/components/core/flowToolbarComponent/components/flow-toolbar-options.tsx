@@ -5,6 +5,7 @@ import useFlowStore from "@/stores/flowStore";
 // import DeployButton from "./deploy-button";
 import PublishDropdown from "./deploy-dropdown";
 import { FlowDeploymentStatusIndicator } from "./deployment-status";
+import ManageMarketplaceButton from "./manage-marketplace-button";
 import MarketplaceDeployButton from "./marketplace-deploy-button";
 import PlaygroundButton from "./playground-button";
 
@@ -27,6 +28,7 @@ const FlowToolbarOptions = ({
         setOpenApiModal={setOpenApiModal}
       />
       <MarketplaceDeployButton />
+      <ManageMarketplaceButton />
       {/* <DeployButton /> */}
       <FlowDeploymentStatusIndicator flowId={currentFlowId} />
     </div>

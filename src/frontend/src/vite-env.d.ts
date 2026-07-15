@@ -24,6 +24,8 @@ interface ImportMetaEnv {
   readonly CI: string;
   readonly LANGFLOW_AUTO_LOGIN: string;
   readonly LANGFLOW_MCP_COMPOSER_ENABLED: string;
+  // URL of the marketplace UI (for the "Manage Agents in Marketplace" button).
+  readonly VITE_MARKETPLACE_UI_URL?: string;
 }
 
 interface ImportMeta {

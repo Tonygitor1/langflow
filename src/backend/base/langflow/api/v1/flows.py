@@ -614,7 +614,10 @@ async def deploy_to_marketplace(
     executor_base = os.getenv("EXECUTOR_BASE_URL", "http://localhost:8013")
     payload = {
         "agent_id": str(flow_id),
-        "user_id": str(current_user.id),
+        # Forward the producer's email as the deployment owner. In this
+        # Keycloak realm preferred_username == email, and SSO stores it as the
+        # Langflow username — the marketplace keys its users table on it.
+        "username": current_user.username,
         "flow_id": str(flow_id),
         "flow_name": flow.name,
         "graph_data": flow.data,

@@ -77,6 +77,23 @@ def _get_litellm_credentials(user_id=None) -> tuple[str, str]:
     if not litellm_url:
         litellm_url = os.environ.get("LITELLM_URL", "http://localhost:4000")
     if not litellm_key:
+        # Falling back to the shared master key means the call is NOT billed to
+        # this user. When a user_id was supplied, that is a misconfiguration —
+        # either the LITELLM_KEY variable is missing, or it exists but could not
+        # be decrypted because LANGFLOW_SECRET_KEY changed (look for "API key
+        # decryption failed" logged just above). Warn instead of failing
+        # silently: the run still works, so the only symptom is mis-billing.
+        if user_id and str(user_id) != "None":
+            from lfx.log.logger import logger
+
+            logger.warning(
+                "LITELLM_KEY could not be resolved for user %s — falling back to "
+                "the shared LITELLM_MASTER_KEY, so this usage is NOT billed to "
+                "the user. Check that the user's LITELLM_KEY variable exists and "
+                "that LANGFLOW_SECRET_KEY is stable (a changed secret key makes "
+                "existing encrypted variables undecryptable).",
+                user_id,
+            )
         litellm_key = os.environ.get("LITELLM_MASTER_KEY", "dummy")
 
     # A per-request forwarded key (from the executor proxy) wins over the
