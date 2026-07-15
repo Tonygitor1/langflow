@@ -248,6 +248,17 @@ async def _upsert_sso_profile(
         )
     )
     profile = result.first()
+
+    if profile is None:
+        # user_id is UNIQUE here (ix_sso_user_profile_user_id): a user has at
+        # most one profile. A caller that asserts a different sub for a user who
+        # already has one (e.g. the executor's internal/local paths, which don't
+        # always know the real sub) must not insert a second row. Reuse the
+        # existing profile instead, and keep its sso_user_id — never overwrite a
+        # real SSO identity with an asserted one.
+        result = await db.exec(select(SSOUserProfile).where(SSOUserProfile.user_id == user_id))
+        profile = result.first()
+
     now = datetime.now(timezone.utc)
     if profile is None:
         profile = SSOUserProfile(
