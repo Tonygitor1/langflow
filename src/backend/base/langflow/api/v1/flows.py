@@ -611,7 +611,7 @@ async def deploy_to_marketplace(
     if not flow.data:
         raise HTTPException(status_code=422, detail="Flow has no graph data — build it before deploying")
 
-    executor_base = os.getenv("EXECUTOR_BASE_URL", "http://localhost:8013")
+    executor_base = os.getenv("MARKETPLACE_SERVICE_BASE_URL", "http://localhost:8014")
     payload = {
         "agent_id": str(flow_id),
         # Forward the producer's email as the deployment owner. In this
@@ -650,7 +650,7 @@ async def get_deployment_status(
     GET /deploy/{agent_id} (agent_id == flow_id). Returns {"status":
     "not_deployed"} when the flow was never published.
     """
-    executor_base = os.getenv("EXECUTOR_BASE_URL", "http://localhost:8013")
+    executor_base = os.getenv("MARKETPLACE_SERVICE_BASE_URL", "http://localhost:8014")
     try:
         async with httpx.AsyncClient(timeout=20.0) as client:
             resp = await client.get(f"{executor_base}/deploy/{flow_id}")
