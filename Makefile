@@ -303,6 +303,23 @@ else
 		$(if $(workers),--workers $(workers),)
 endif
 
+backend_local:
+	@echo "Killing any process running on port 7860 (if any)"
+	@-kill -9 $$(lsof -t -i:7860) || true
+	@echo "Syncing backend dependencies"
+	uv sync
+	@echo "Running backend locally";
+	uv run uvicorn \
+		--factory langflow.main:create_app \
+		--host 0.0.0.0 \
+		--port $(port) \
+		--reload \
+		--reload-exclude "src/frontend/*" \
+		--reload-exclude ".venv/*" \
+		--reload-exclude "__pycache__/*" \
+		--reload-exclude "node_modules/*" \
+		--loop asyncio
+
 build_and_run: setup_env ## build the project and run it
 	$(call CLEAR_DIRS,dist src/backend/base/dist)
 	make build

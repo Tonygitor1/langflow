@@ -16,6 +16,7 @@ from fastapi.encoders import jsonable_encoder
 from fastapi_pagination import Page, Params
 from fastapi_pagination.ext.sqlmodel import apaginate
 from lfx.services.cache.utils import CACHE_MISS
+from pydantic import BaseModel, Field
 from sqlmodel import and_, col, select
 
 from langflow.api.utils import (
@@ -571,12 +572,32 @@ async def read_basic_examples(
 _logger = logging.getLogger(__name__)
 
 
+class DeployMarketplaceBody(BaseModel):
+    """A2A AgentCard configuration — required for marketplace deployment."""
+
+    a2a_config: A2AMarketplaceConfig
+
+
+class A2AMarketplaceConfig(BaseModel):
+    name: str
+    description: str = ""
+    version: str = "1.0.0"
+    capabilities: dict = Field(default_factory=lambda: {"streaming": True})
+    authentication: dict = Field(default_factory=lambda: {"schemes": []})
+    defaultInputModes: list[str] = Field(default_factory=lambda: ["text"])
+    defaultOutputModes: list[str] = Field(default_factory=lambda: ["text"])
+    skills: list[dict] = Field(default_factory=list)
+    provider: dict | None = None
+    documentationUrl: str | None = None
+
+
 @router.post("/{flow_id}/deploy-marketplace", status_code=200)
 async def deploy_to_marketplace(
     *,
     session: DbSession,
     flow_id: UUID,
     current_user: CurrentActiveUser,
+    body: DeployMarketplaceBody,
 ):
     """Deploy a flow as a long-lived agent container via the Executor service.
 
@@ -590,13 +611,17 @@ async def deploy_to_marketplace(
     if not flow.data:
         raise HTTPException(status_code=422, detail="Flow has no graph data — build it before deploying")
 
-    executor_base = os.getenv("EXECUTOR_BASE_URL", "http://localhost:8013")
+    executor_base = os.getenv("MARKETPLACE_SERVICE_BASE_URL", "http://localhost:8014")
     payload = {
         "agent_id": str(flow_id),
-        "user_id": str(current_user.id),
+        # Forward the producer's email as the deployment owner. In this
+        # Keycloak realm preferred_username == email, and SSO stores it as the
+        # Langflow username — the marketplace keys its users table on it.
+        "username": current_user.username,
         "flow_id": str(flow_id),
         "flow_name": flow.name,
         "graph_data": flow.data,
+        "a2a_config": body.a2a_config.model_dump(),
     }
 
     try:
@@ -610,6 +635,33 @@ async def deploy_to_marketplace(
         _logger.error("executor returned %s for flow %s: %s", resp.status_code, flow_id, resp.text[:500])
         raise HTTPException(status_code=resp.status_code, detail=resp.text[:500])
 
+    return resp.json()
+
+
+@router.get("/{flow_id}/deployment-status", status_code=200)
+async def get_deployment_status(
+    *,
+    flow_id: UUID,
+    current_user: CurrentActiveUser,  # noqa: ARG001 — gates the route to authenticated users
+):
+    """Return the deployment status of a flow (proxy to the Executor).
+
+    The browser only talks to Langflow, so this proxies the executor's
+    GET /deploy/{agent_id} (agent_id == flow_id). Returns {"status":
+    "not_deployed"} when the flow was never published.
+    """
+    executor_base = os.getenv("MARKETPLACE_SERVICE_BASE_URL", "http://localhost:8014")
+    try:
+        async with httpx.AsyncClient(timeout=20.0) as client:
+            resp = await client.get(f"{executor_base}/deploy/{flow_id}")
+    except httpx.HTTPError as exc:
+        _logger.warning("executor deploy-status unreachable for flow %s: %s", flow_id, exc)
+        return {"status": "unknown", "detail": "executor unreachable"}
+
+    if resp.status_code == 404:
+        return {"status": "not_deployed"}
+    if resp.status_code >= 400:
+        raise HTTPException(status_code=resp.status_code, detail=resp.text[:500])
     return resp.json()
 
 

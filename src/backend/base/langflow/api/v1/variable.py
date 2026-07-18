@@ -1,10 +1,12 @@
 import asyncio
 import json
 import logging
+import os
 from uuid import UUID
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from lfx.base.models.unified_models import get_model_provider_variable_mapping, validate_model_provider_key
+from pydantic import BaseModel
 from sqlalchemy.exc import NoResultFound
 from sqlmodel import select
 
@@ -469,3 +471,129 @@ async def detect_env_vars(
         candidate_keys.update(_collect_candidate_variable_keys_from_flow_data(data))
 
     return DetectVarsResponse(variables=sorted(existing_variable_names.intersection(candidate_keys)))
+
+
+# ── Internal service-to-service endpoint ───────────────────────────────────
+
+
+_INTERNAL_API_KEY = os.getenv("AGENTS_MARKET_INTERNAL_API_KEY", "")
+
+
+def _verify_service_account(request: Request) -> str:
+    """Validate the x-api-key header for internal service-to-service calls."""
+    header = request.headers.get("x-api-key", "")
+    if not _INTERNAL_API_KEY or not header or header != _INTERNAL_API_KEY:
+        raise HTTPException(status_code=403, detail="Forbidden: invalid x-api-key")
+    return header
+
+
+@router.get("/internal/{variable_name}", status_code=200, include_in_schema=False)
+async def get_internal_variable(
+    variable_name: str,
+    *,
+    session: DbSession,
+    user_id: UUID = Query(...),
+    _sa: str = Depends(_verify_service_account),
+):
+    """Return the decrypted value of a variable for a given user.
+
+    Internal endpoint used by the executor service to resolve per-user
+    LITELLM_KEY without requiring end-user authentication.
+    """
+    variable_service = get_variable_service()
+    if not isinstance(variable_service, DatabaseVariableService):
+        msg = "Variable service is not an instance of DatabaseVariableService"
+        raise TypeError(msg)
+
+    try:
+        variable = await variable_service.get_variable_object(
+            user_id=user_id, name=variable_name, session=session
+        )
+    except ValueError:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Variable '{variable_name}' not found for user {user_id}",
+        )
+
+    if variable is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Variable '{variable_name}' not found for user {user_id}",
+        )
+
+    # Decrypt if credential type
+    if variable.type == CREDENTIAL_TYPE and variable.value:
+        try:
+            value = auth_utils.decrypt_api_key(variable.value)
+        except Exception:
+            value = variable.value
+    else:
+        value = variable.value
+
+    return {
+        "name": variable.name,
+        "value": value,
+        "user_id": str(variable.user_id),
+    }
+
+
+class EnsureUserRequest(BaseModel):
+    """External identity to find-or-create a Langflow user for.
+
+    ``sub`` is a stable external identity — the Keycloak ``sub`` claim for
+    real users, or any stable synthetic id for local-dev bypass callers.
+    """
+
+    sub: str
+    username: str
+    email: str | None = None
+    is_platform_admin: bool = False
+    provider_name: str = "keycloak"
+
+
+@router.post("/internal/ensure-user", status_code=200, include_in_schema=False)
+async def ensure_internal_user(
+    req: EnsureUserRequest,
+    *,
+    session: DbSession,
+    _sa: str = Depends(_verify_service_account),
+):
+    """Find-or-create a Langflow user for an external identity and sync their LITELLM_KEY.
+
+    Used by the executor to lazily provision "consumer" users, who are
+    blocked from ever logging into the Langflow builder (see
+    oidc_sso._ALLOWED_ROLES) and so would otherwise never get a Langflow
+    User row or a LITELLM_KEY. Reuses the exact same provisioning logic
+    as the OIDC callback (find_or_create_sso_user).
+    """
+    from langflow.api.v1.oidc_sso import find_or_create_sso_user
+
+    user = await find_or_create_sso_user(
+        session,
+        sub_claim=req.sub,
+        username=req.username,
+        email=req.email,
+        is_platform_admin=req.is_platform_admin,
+        provider_name=req.provider_name,
+    )
+
+    variable_service = get_variable_service()
+    litellm_key: str | None = None
+    if isinstance(variable_service, DatabaseVariableService):
+        try:
+            variable = await variable_service.get_variable_object(
+                user_id=user.id, name="LITELLM_KEY", session=session
+            )
+            if variable and variable.value:
+                try:
+                    litellm_key = auth_utils.decrypt_api_key(variable.value)
+                except Exception:
+                    litellm_key = variable.value
+        except ValueError:
+            litellm_key = None
+
+    return {
+        "user_id": str(user.id),
+        "username": user.username,
+        "litellm_key": litellm_key,
+    }

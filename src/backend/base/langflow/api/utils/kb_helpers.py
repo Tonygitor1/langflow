@@ -592,6 +592,10 @@ class KBIngestionHelper:
             text_splitter = RecursiveCharacterTextSplitter(**splitter_kwargs)
 
             embeddings = await KBIngestionHelper._build_embeddings(embedding_provider, embedding_model, current_user)
+            logger.info(
+                f"Built embeddings: provider={embedding_provider}, model={embedding_model}, "
+                f"type={type(embeddings).__name__}"
+            )
 
             client = KBStorageHelper.get_chroma_client(kb_path)
             chroma = Chroma(
@@ -607,15 +611,30 @@ class KBIngestionHelper:
 
                 await logger.ainfo("Starting ingestion of %s for %s", file_name, kb_name)
                 content = extract_text_from_bytes(file_name, file_content)
+                logger.info(f"Extracted text from {file_name}: {len(content)} characters")
+                # Diagnostic: show a preview of what was actually extracted
+                preview = content[:200].replace("\n", "\\n").replace("\t", "\\t")
+                logger.info(f"Extracted content preview (first 200 chars): {preview}")
+                logger.info(f"Content strip length: {len(content.strip())}")
                 if not content.strip():
+                    logger.warning(
+                        f"Skipping {file_name}: extracted {len(content)} chars but all whitespace. "
+                        f"Raw bytes: {file_content[:100]!r}"
+                    )
                     continue
 
                 chunks = text_splitter.split_text(content)
+                logger.info(f"Split {file_name} into {len(chunks)} chunks")
+
                 for i in range(0, len(chunks), INGESTION_BATCH_SIZE):
                     if await KBIngestionHelper._is_job_cancelled(job_service, task_job_id):
                         raise IngestionCancelledError
 
                     batch = chunks[i : i + INGESTION_BATCH_SIZE]
+                    logger.info(
+                        f"Embedding batch {i // INGESTION_BATCH_SIZE + 1}: "
+                        f"{len(batch)} chunks, first chunk preview: {batch[0][:100]!r}"
+                    )
                     docs = [
                         Document(
                             page_content=c,
@@ -636,6 +655,9 @@ class KBIngestionHelper:
                             raise IngestionCancelledError
                         try:
                             await chroma.aadd_documents(docs)
+                            logger.info(
+                                f"Successfully wrote batch of {len(docs)} documents to Chroma"
+                            )
                             break
                         except Exception as e:
                             if attempt == MAX_RETRY_ATTEMPTS - 1:

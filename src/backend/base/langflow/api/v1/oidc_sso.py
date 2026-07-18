@@ -50,7 +50,7 @@ import os
 import secrets
 from datetime import datetime, timezone
 from typing import Optional
-from urllib.parse import urlencode, urlparse
+from urllib.parse import urlencode, urlparse, urlunparse
 
 import httpx
 from fastapi import APIRouter, HTTPException, Request, Response
@@ -116,6 +116,8 @@ async def _fetch_discovery() -> dict:
         resp = await hc.get(discovery_url, timeout=10)
         resp.raise_for_status()
         _oidc_discovery_cache = resp.json()
+        logger.info(f"Fetched OIDC discovery document from {discovery_url}")
+        logger.info(f"Fetched OIDC discovery document:\n{json.dumps(_oidc_discovery_cache, indent=2)}")
     return _oidc_discovery_cache
 
 
@@ -125,6 +127,32 @@ async def _fetch_discovery() -> dict:
 class OidcConfig(BaseModel):
     enabled: bool
     label: str = "Sign in with SSO"
+
+
+class IdTokenClaims(BaseModel):
+    """Claims extracted from an OIDC id_token JWT payload."""
+
+    sub: str
+    email: str | None = None
+    email_verified: bool | None = None
+    name: str | None = None
+    preferred_username: str | None = None
+    given_name: str | None = None
+    family_name: str | None = None
+
+
+def _rewrite_url_origin(url: str) -> str:
+    """Replace the scheme and netloc of *url* with LANGFLOW_KEYCLOAK_PUBLIC_URL.
+
+    When the OIDC provider is behind a reverse proxy the discovery document
+    returns internal URLs.  Set LANGFLOW_KEYCLOAK_PUBLIC_URL to the
+    browser-facing origin so redirects point to the right place.
+    """
+    public_url = os.getenv("LANGFLOW_KEYCLOAK_PUBLIC_URL", "").rstrip("/")
+    if not public_url:
+        return url
+    parsed_public = urlparse(public_url)
+    return urlunparse(urlparse(url)._replace(scheme=parsed_public.scheme, netloc=parsed_public.netloc))
 
 
 def _frontend_origin(request: Request) -> str:
@@ -145,15 +173,21 @@ def _pkce_pair() -> tuple[str, str]:
     return verifier, challenge
 
 
+def _decode_jwt_payload(token: str) -> dict:
+    """Decode the payload portion of a JWT without verifying signature."""
+    try:
+        raw = token.split(".")[1]
+        raw += "=" * (4 - len(raw) % 4)
+        return json.loads(base64.urlsafe_b64decode(raw))
+    except Exception:
+        return {}
+
+
 def _realm_roles_from_token(access_token: str) -> set[str]:
     """Decode the JWT payload (no signature verification) and return realm roles."""
-    try:
-        raw = access_token.split(".")[1]
-        raw += "=" * (4 - len(raw) % 4)
-        payload = json.loads(base64.urlsafe_b64decode(raw))
-        return set(payload.get("realm_access", {}).get("roles", []))
-    except Exception:
-        return set()
+    payload = _decode_jwt_payload(access_token)
+    return set(payload.get("realm_access", {}).get("roles", []))
+
 
 
 async def _ensure_sso_config(db) -> None:
@@ -214,6 +248,17 @@ async def _upsert_sso_profile(
         )
     )
     profile = result.first()
+
+    if profile is None:
+        # user_id is UNIQUE here (ix_sso_user_profile_user_id): a user has at
+        # most one profile. A caller that asserts a different sub for a user who
+        # already has one (e.g. the executor's internal/local paths, which don't
+        # always know the real sub) must not insert a second row. Reuse the
+        # existing profile instead, and keep its sso_user_id — never overwrite a
+        # real SSO identity with an asserted one.
+        result = await db.exec(select(SSOUserProfile).where(SSOUserProfile.user_id == user_id))
+        profile = result.first()
+
     now = datetime.now(timezone.utc)
     if profile is None:
         profile = SSOUserProfile(
@@ -411,6 +456,74 @@ async def _sync_user_to_litellm(db, user: User, username: str) -> None:
         logger.exception("Failed to sync user %s to LiteLLM — continuing login", username)
 
 
+async def find_or_create_sso_user(
+    db,
+    *,
+    sub_claim: str,
+    username: str,
+    email: str | None,
+    is_platform_admin: bool,
+    provider_name: str,
+    sync_litellm: bool = True,
+) -> User:
+    """Find or create a Langflow User for an external SSO identity.
+
+    Shared by the browser OIDC callback (oidc_callback below) and the
+    internal POST /variables/internal/ensure-user endpoint, which the
+    executor calls to lazily provision consumer users who are blocked
+    from ever logging into the builder (see _ALLOWED_ROLES) and so would
+    otherwise never get a Langflow User row or a LITELLM_KEY.
+    """
+    auth = get_auth_service()
+
+    # Primary: resolve via SSOUserProfile (stable sub → Langflow user.id link).
+    result = await db.exec(
+        select(SSOUserProfile).where(
+            SSOUserProfile.sso_provider == provider_name,
+            SSOUserProfile.sso_user_id == sub_claim,
+        )
+    )
+    sso_profile = result.first()
+
+    user: User | None = None
+    if sso_profile is not None:
+        user = await db.get(User, sso_profile.user_id)
+        if user is None:
+            sso_profile = None
+
+    if user is None:
+        user = await get_user_by_username(db, username)
+
+    if user is None:
+        user = User(
+            username=username,
+            # Random password — SSO users never authenticate with it directly.
+            password=auth.get_password_hash(secrets.token_urlsafe(32)),
+            is_active=True,
+            is_superuser=is_platform_admin,
+        )
+        db.add(user)
+        await db.commit()
+        await db.refresh(user)
+        await get_or_create_default_folder(db, user.id)
+    elif user.is_superuser != is_platform_admin:
+        user.is_superuser = is_platform_admin
+        db.add(user)
+        await db.commit()
+        await db.refresh(user)
+
+    if not user.is_active:
+        raise HTTPException(status_code=403, detail="Your account is inactive. Contact a platform administrator.")
+
+    await _upsert_sso_profile(db, user_id=str(user.id), provider_name=provider_name, sub_claim=sub_claim, email=email)
+
+    # Sync non-admin users to LiteLLM on first login so they get a personal API key.
+    if sync_litellm and username != "admin" and not getattr(user, "synced_llm", False):
+        await _sync_user_to_litellm(db, user, username)
+
+    return user
+
+
 # ── routes ────────────────────────────────────────────────────────────────────
 
 
@@ -451,7 +564,7 @@ async def oidc_authorize(request: Request, db: DbSession) -> RedirectResponse:
         "code_challenge": challenge,
         "code_challenge_method": "S256",
     })
-    auth_url = f"{discovery['authorization_endpoint']}?{params}"
+    auth_url = _rewrite_url_origin(f"{discovery['authorization_endpoint']}?{params}")
 
     resp = RedirectResponse(url=auth_url, status_code=302)
     resp.set_cookie("oidc_state", state_payload, max_age=300, httponly=True, samesite="lax")
@@ -525,21 +638,36 @@ async def oidc_callback(
         if id_token:
             logout_params["id_token_hint"] = id_token
         end_session_endpoint = discovery.get("end_session_endpoint", "")
-        logout_url = f"{end_session_endpoint}?{urlencode(logout_params)}"
+        
+        logout_url = _rewrite_url_origin(f"{end_session_endpoint}?{urlencode(logout_params)}")
+
         resp = RedirectResponse(url=logout_url, status_code=302)
         resp.set_cookie("sso_error", error_msg, httponly=False, samesite="lax", max_age=60)
         return resp
 
-    async with httpx.AsyncClient() as hc:
-        userinfo_resp = await hc.get(
-            discovery["userinfo_endpoint"],
-            headers={"Authorization": f"Bearer {access_token}"},
-        )
+    # Try to fetch userinfo from the provider; fall back to id_token claims.
+    userinfo: dict = {}
+    try:
+        async with httpx.AsyncClient() as hc:
+            userinfo_resp = await hc.get(
+                discovery["userinfo_endpoint"],
+                headers={"Authorization": f"Bearer {access_token}"},
+            )
+        if userinfo_resp.status_code == 200:
+            userinfo = userinfo_resp.json()
+        else:
+            logger.warning(
+                "Userinfo endpoint returned %s, falling back to id_token claims",
+                userinfo_resp.status_code,
+            )
+    except Exception:
+        logger.warning("Failed to fetch userinfo from provider, falling back to id_token claims")
 
-    if userinfo_resp.status_code != 200:
+    if not userinfo and id_token:
+        userinfo = _decode_jwt_payload(id_token)
+
+    if not userinfo:
         raise HTTPException(status_code=401, detail="Failed to fetch user info from SSO provider")
-
-    userinfo = userinfo_resp.json()
 
     sub_claim: str = userinfo.get("sub", "")
     username: str = userinfo.get("preferred_username") or sub_claim
@@ -551,50 +679,14 @@ async def oidc_callback(
     is_platform_admin = "platform_admin" in realm_roles
     auth = get_auth_service()
 
-    # Primary: resolve via SSOUserProfile (stable sub → Langflow user.id link).
-    result = await db.exec(
-        select(SSOUserProfile).where(
-            SSOUserProfile.sso_provider == provider_name,
-            SSOUserProfile.sso_user_id == sub_claim,
-        )
+    user = await find_or_create_sso_user(
+        db,
+        sub_claim=sub_claim,
+        username=username,
+        email=email,
+        is_platform_admin=is_platform_admin,
+        provider_name=provider_name,
     )
-    sso_profile = result.first()
-
-    user: User | None = None
-    if sso_profile is not None:
-        user = await db.get(User, sso_profile.user_id)
-        if user is None:
-            sso_profile = None
-
-    if user is None:
-        user = await get_user_by_username(db, username)
-
-    if user is None:
-        user = User(
-            username=username,
-            # Random password — SSO users never authenticate with it directly.
-            password=auth.get_password_hash(secrets.token_urlsafe(32)),
-            is_active=True,
-            is_superuser=is_platform_admin,
-        )
-        db.add(user)
-        await db.commit()
-        await db.refresh(user)
-        await get_or_create_default_folder(db, user.id)
-    elif user.is_superuser != is_platform_admin:
-        user.is_superuser = is_platform_admin
-        db.add(user)
-        await db.commit()
-        await db.refresh(user)
-
-    if not user.is_active:
-        raise HTTPException(status_code=403, detail="Your account is inactive. Contact a platform administrator.")
-
-    await _upsert_sso_profile(db, user_id=str(user.id), provider_name=provider_name, sub_claim=sub_claim, email=email)
-
-    # Sync non-admin users to LiteLLM on first login so they get a personal API key.
-    if username != "admin" and not getattr(user, "synced_llm", False):
-        await _sync_user_to_litellm(db, user, username)
 
     lf_tokens = await auth.create_user_tokens(user_id=user.id, db=db, update_last_login=True)
     auth_settings = get_settings_service().auth_settings
@@ -659,7 +751,7 @@ async def oidc_logout(request: Request) -> RedirectResponse:
         params["id_token_hint"] = id_token
 
     end_session_endpoint = discovery.get("end_session_endpoint", "")
-    logout_url = f"{end_session_endpoint}?{urlencode(params)}"
+    logout_url = _rewrite_url_origin(f"{end_session_endpoint}?{urlencode(params)}")
 
     resp = RedirectResponse(url=logout_url, status_code=302)
     resp.delete_cookie("sso_provider")

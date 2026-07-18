@@ -9,6 +9,8 @@ yarn-error.log*
 lerna-debug.log*
 qdrant_storage
 
+data
+
 .dspy_cache
 # Mac
 .DS_Store

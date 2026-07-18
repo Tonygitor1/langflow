@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+from contextvars import ContextVar
 from typing import TYPE_CHECKING, Any
 
 import httpx
@@ -14,15 +15,31 @@ if TYPE_CHECKING:
 
 # ── LiteLLM credentials ───────────────────────────────────────────────────────
 
+# Per-request LiteLLM key forwarded by the agent executor. When an agent is
+# invoked through the executor proxy, the invoking user's own LITELLM_KEY is
+# forwarded (as the X-LANGFLOW-GLOBAL-VAR-LITELLM_KEY header) into the flow
+# run, so the flow's own model calls are billed to that user — not to a shared
+# key baked into the container. Set by the run endpoint (see
+# langflow.api.v1.endpoints._run_flow_internal); read here with top priority.
+# A ContextVar keeps it request-scoped and safe under concurrent invocations.
+_forwarded_litellm_key: ContextVar[str | None] = ContextVar("forwarded_litellm_key", default=None)
+
+
+def set_forwarded_litellm_key(key: str | None) -> None:
+    """Set the per-request forwarded LiteLLM key (call from the run endpoint)."""
+    _forwarded_litellm_key.set(key or None)
+
 
 def _get_litellm_credentials(user_id=None) -> tuple[str, str]:
     """Return (litellm_url, litellm_key) for a user, with env-var fallback.
 
-    When user_id is provided, LITELLM_URL and LITELLM_KEY are read from the
-    variable service (LITELLM_URL is a public platform variable; LITELLM_KEY is
-    a private per-user credential provisioned on first SSO login).
-    Falls back to LITELLM_URL / LITELLM_MASTER_KEY env vars when no user is
-    given or the variable is not found.
+    Key resolution priority:
+      1. Per-request forwarded key (set_forwarded_litellm_key) — the invoking
+         user's key when the flow runs behind the executor proxy.
+      2. The user's private LITELLM_KEY variable (provisioned on first SSO login).
+      3. The LITELLM_MASTER_KEY env var.
+
+    LITELLM_URL comes from the user's public variable or the env var.
     """
     litellm_url: str | None = None
     litellm_key: str | None = None
@@ -60,7 +77,31 @@ def _get_litellm_credentials(user_id=None) -> tuple[str, str]:
     if not litellm_url:
         litellm_url = os.environ.get("LITELLM_URL", "http://localhost:4000")
     if not litellm_key:
+        # Falling back to the shared master key means the call is NOT billed to
+        # this user. When a user_id was supplied, that is a misconfiguration —
+        # either the LITELLM_KEY variable is missing, or it exists but could not
+        # be decrypted because LANGFLOW_SECRET_KEY changed (look for "API key
+        # decryption failed" logged just above). Warn instead of failing
+        # silently: the run still works, so the only symptom is mis-billing.
+        if user_id and str(user_id) != "None":
+            from lfx.log.logger import logger
+
+            logger.warning(
+                "LITELLM_KEY could not be resolved for user %s — falling back to "
+                "the shared LITELLM_MASTER_KEY, so this usage is NOT billed to "
+                "the user. Check that the user's LITELLM_KEY variable exists and "
+                "that LANGFLOW_SECRET_KEY is stable (a changed secret key makes "
+                "existing encrypted variables undecryptable).",
+                user_id,
+            )
         litellm_key = os.environ.get("LITELLM_MASTER_KEY", "dummy")
+
+    # A per-request forwarded key (from the executor proxy) wins over the
+    # user-variable/env resolution above, so agent invocations are billed to
+    # the invoking user rather than a shared key.
+    forwarded_key = _forwarded_litellm_key.get()
+    if forwarded_key:
+        litellm_key = forwarded_key
 
     return litellm_url.rstrip("/"), litellm_key
 
