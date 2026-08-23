@@ -263,6 +263,45 @@ class KBStorageHelper:
             return None
 
     @staticmethod
+    def _s3_metadata_key_prefix(user_id: str, kb_id: str) -> str:
+        """Return the S3 key prefix for a KB's metadata sidecar files.
+
+        Layout: <object_storage_prefix>/<user_id>/knowledge_base/<kb_id>/metadata
+        Holds embedding_metadata.json + schema.json — the small sidecar files a
+        deployed agent needs to resolve a KB (its UUID + embedding config). The
+        vectors themselves live in the shared Chroma service, keyed by kb_id.
+        """
+        prefix = os.environ.get("LANGFLOW_OBJECT_STORAGE_PREFIX", "").rstrip("/")
+        if prefix:
+            return f"{prefix}/{user_id}/knowledge_base/{kb_id}/metadata"
+        return f"{user_id}/knowledge_base/{kb_id}/metadata"
+
+    @staticmethod
+    def upload_metadata_to_s3(kb_path: Path, user_id: str, kb_id: str) -> None:
+        """Upload a KB's metadata sidecar files to S3 (best-effort, durable copy).
+
+        Uploads embedding_metadata.json and schema.json (when present) so the KB
+        definition survives independently of the builder's local disk. Vectors
+        are NOT uploaded here — they live in the shared Chroma service.
+        """
+        bucket = os.environ.get("LANGFLOW_OBJECT_STORAGE_BUCKET_NAME")
+        if not bucket:
+            logger.debug("S3 bucket not configured — skipping metadata upload for KB %s", kb_id)
+            return
+
+        try:
+            s3 = boto3.client("s3")
+            for file_name in ("embedding_metadata.json", "schema.json"):
+                file_path = kb_path / file_name
+                if not file_path.exists():
+                    continue
+                s3_key = f"{KBStorageHelper._s3_metadata_key_prefix(user_id, kb_id)}/{file_name}"
+                s3.put_object(Bucket=bucket, Key=s3_key, Body=file_path.read_bytes())
+                logger.info("Uploaded KB metadata %s to s3://%s/%s", file_name, bucket, s3_key)
+        except Exception as e:  # noqa: BLE001
+            logger.warning("S3 metadata upload failed for KB %s: %s", kb_id, e)
+
+    @staticmethod
     def _delete_kb_documents_from_s3(kb_id: str) -> None:
         """Delete all S3 objects under the KB documents prefix (best-effort, all users)."""
         bucket = os.environ.get("LANGFLOW_OBJECT_STORAGE_BUCKET_NAME")
@@ -683,6 +722,10 @@ class KBIngestionHelper:
             metadata["source_types"] = list(set(existing_source_types + new_source_types))
             metadata_path.write_text(json.dumps(metadata, indent=2))
             await logger.ainfo(f"Completed ingestion for {kb_name}")
+
+            # Upload the metadata sidecar to S3 so a deployed agent can restore
+            # the KB definition without touching the builder's local disk.
+            KBStorageHelper.upload_metadata_to_s3(kb_path, user_id, kb_id)
 
             return {
                 "message": f"Successfully ingested {len(processed_files)} file(s)",
