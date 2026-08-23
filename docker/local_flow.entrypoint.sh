@@ -16,53 +16,6 @@ REGISTRY_CALLBACK_URL="${REGISTRY_CALLBACK_URL:-}"
 
 export PATH="/app/.venv/bin:$PATH"
 
-# ── Restore knowledge-base metadata sidecars (RAG) ────────────────────────────
-# A published flow's KBs keep their vectors in the shared Chroma service (keyed
-# by KB UUID), but the retrieval component also needs each KB's local metadata
-# sidecar (embedding_metadata.json + schema.json) to resolve that UUID and the
-# embedding config. The marketplace service delivers these via the agent-kb
-# ConfigMap mounted at /opt/langflow-kb; restore them under the KB root for the
-# forced auto-login superuser ("langflow") before Langflow starts.
-KB_BOOTSTRAP_PATH="${KB_BOOTSTRAP_PATH:-/opt/langflow-kb/kb_bootstrap.json}"
-KB_DEST_ROOT="${LANGFLOW_CONFIG_DIR:-/app/data}/.langflow/knowledge_bases/langflow"
-if [ -f "$KB_BOOTSTRAP_PATH" ]; then
-    echo "[entrypoint] Restoring knowledge-base metadata from ${KB_BOOTSTRAP_PATH} ..."
-    KB_DEST_ROOT="$KB_DEST_ROOT" KB_BOOTSTRAP_PATH="$KB_BOOTSTRAP_PATH" python3 <<'PYEOF' || echo "[entrypoint] WARNING: KB metadata restore failed (continuing)"
-import json
-import os
-from pathlib import Path
-
-src = Path(os.environ["KB_BOOTSTRAP_PATH"])
-dest_root = Path(os.environ["KB_DEST_ROOT"])
-
-try:
-    entries = json.loads(src.read_text() or "[]")
-except Exception as exc:  # noqa: BLE001
-    print(f"[entrypoint] WARNING: could not parse KB bootstrap: {exc}")
-    entries = []
-
-restored = 0
-for entry in entries if isinstance(entries, list) else []:
-    name = (entry or {}).get("name")
-    if not name:
-        continue
-    kb_dir = dest_root / name
-    kb_dir.mkdir(parents=True, exist_ok=True)
-    meta = entry.get("embedding_metadata")
-    if meta:
-        (kb_dir / "embedding_metadata.json").write_text(meta)
-    schema = entry.get("schema")
-    if schema:
-        (kb_dir / "schema.json").write_text(schema)
-    restored += 1
-    print(f"[entrypoint] Restored KB '{name}' -> {kb_dir}")
-
-print(f"[entrypoint] KB metadata restore complete ({restored} knowledge base(s)).")
-PYEOF
-else
-    echo "[entrypoint] No KB bootstrap found at ${KB_BOOTSTRAP_PATH}; skipping KB restore."
-fi
-
 # ── Start Langflow in background ──────────────────────────────────────────────
 echo "[entrypoint] Starting Langflow on ${LANGFLOW_HOST}:${LANGFLOW_PORT} ..."
 langflow run --host "$LANGFLOW_HOST" --port "$LANGFLOW_PORT" &
