@@ -591,6 +591,65 @@ class A2AMarketplaceConfig(BaseModel):
     documentationUrl: str | None = None
 
 
+# Component type names that reference a knowledge base by name.
+_KB_COMPONENT_TYPES = {"KnowledgeBase", "KnowledgeIngestion"}
+
+
+def _extract_kb_names_from_graph(graph_data: dict) -> set[str]:
+    """Collect the knowledge-base names referenced by a flow graph.
+
+    Looks for KnowledgeBase / KnowledgeIngestion nodes and reads their selected
+    ``knowledge_base`` template value. Defensive against partial/legacy shapes.
+    """
+    names: set[str] = set()
+    for node in (graph_data or {}).get("nodes", []):
+        if not isinstance(node, dict):
+            continue
+        node_data = node.get("data") or {}
+        node_type = node_data.get("type", "")
+        if node_type not in _KB_COMPONENT_TYPES:
+            continue
+        template = ((node_data.get("node") or {}).get("template")) or {}
+        kb_field = template.get("knowledge_base") or {}
+        value = kb_field.get("value")
+        if isinstance(value, str) and value:
+            names.add(value)
+    return names
+
+
+def _collect_kb_bootstrap(graph_data: dict, username: str) -> list[dict]:
+    """Read the metadata sidecars for the KBs a flow references.
+
+    Returns a list of ``{name, embedding_metadata, schema?}`` entries (file
+    contents as strings) that the marketplace service delivers to the agent pod,
+    which restores them under ``<kb_root>/langflow/<name>/`` on startup. Only the
+    tiny sidecar files travel; the vectors stay in the shared Chroma service.
+    Best-effort: never fails a deploy over KB collection.
+    """
+    bootstrap: list[dict] = []
+    try:
+        from langflow.api.utils.kb_helpers import KBStorageHelper
+
+        kb_root = KBStorageHelper.get_root_path()
+        for kb_name in _extract_kb_names_from_graph(graph_data):
+            kb_dir = kb_root / username / kb_name
+            meta_file = kb_dir / "embedding_metadata.json"
+            if not meta_file.exists():
+                _logger.warning("KB %r referenced by flow has no metadata at %s", kb_name, meta_file)
+                continue
+            entry: dict[str, str] = {
+                "name": kb_name,
+                "embedding_metadata": meta_file.read_text(encoding="utf-8"),
+            }
+            schema_file = kb_dir / "schema.json"
+            if schema_file.exists():
+                entry["schema"] = schema_file.read_text(encoding="utf-8")
+            bootstrap.append(entry)
+    except Exception:  # noqa: BLE001
+        _logger.exception("Failed to collect knowledge-base bootstrap metadata")
+    return bootstrap
+
+
 @router.post("/{flow_id}/deploy-marketplace", status_code=200)
 async def deploy_to_marketplace(
     *,
@@ -622,6 +681,10 @@ async def deploy_to_marketplace(
         "flow_name": flow.name,
         "graph_data": flow.data,
         "a2a_config": body.a2a_config.model_dump(),
+        # KB metadata sidecars for any knowledge bases the flow references, so
+        # the agent container can restore them locally (vectors already live in
+        # the shared Chroma service, keyed by each KB's UUID).
+        "knowledge_bases": _collect_kb_bootstrap(flow.data, current_user.username),
     }
 
     try:

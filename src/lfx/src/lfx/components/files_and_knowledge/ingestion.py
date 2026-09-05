@@ -288,7 +288,42 @@ class KnowledgeIngestionComponent(Component):
         """Save embedding model metadata."""
         embedding_metadata = self._build_embedding_metadata(model_selection, api_key)
         metadata_path = kb_path / "embedding_metadata.json"
+        # Preserve a stable KB UUID across re-saves — it is the Chroma collection
+        # name (see _get_or_create_kb_id), so regenerating it would orphan vectors.
+        if metadata_path.exists():
+            try:
+                existing = json.loads(metadata_path.read_text())
+                if existing.get("id"):
+                    embedding_metadata["id"] = existing["id"]
+            except (OSError, json.JSONDecodeError):
+                pass
+        embedding_metadata.setdefault("id", str(uuid.uuid4()))
         metadata_path.write_text(json.dumps(embedding_metadata, indent=2))
+
+    def _get_or_create_kb_id(self, kb_path: Path) -> str:
+        """Return the KB's stable UUID, generating + persisting one if absent.
+
+        The UUID is used as the Chroma collection name so collections are
+        globally unique in the shared Chroma service and resolvable by a
+        deployed agent (which reads it back from embedding_metadata.json).
+        """
+        metadata_path = kb_path / "embedding_metadata.json"
+        metadata: dict[str, Any] = {}
+        if metadata_path.exists():
+            try:
+                metadata = json.loads(metadata_path.read_text())
+            except (OSError, json.JSONDecodeError):
+                metadata = {}
+        kb_id = metadata.get("id")
+        if not kb_id:
+            kb_id = str(uuid.uuid4())
+            metadata["id"] = kb_id
+            try:
+                kb_path.mkdir(parents=True, exist_ok=True)
+                metadata_path.write_text(json.dumps(metadata, indent=2))
+            except OSError as e:
+                self.log(f"Could not persist KB id: {e}")
+        return kb_id
 
     def _update_metadata_metrics(self, kb_path: Path, chroma: Chroma) -> None:
         """Update embedding_metadata.json with accurate chunk/word/character counts.
@@ -370,26 +405,35 @@ class KnowledgeIngestionComponent(Component):
         config_list: list[dict[str, Any]],
         embedding_function,
     ) -> Chroma:
-        """Create vector store following Local DB component pattern.
+        """Create vector store in the shared Chroma service (remote-aware).
 
-        Returns the Chroma instance so callers can use it for metrics updates.
+        Uses the KB's UUID as the collection name and the CHROMA_HOST-aware
+        client factory so component-ingested vectors land in the same place the
+        API-upload path and the retrieval component read from. Returns the Chroma
+        instance so callers can use it for metrics updates.
         """
-        # Set up vector store directory
-        vector_store_dir = await self._kb_path()
-        if not vector_store_dir:
+        from langflow.api.utils.kb_helpers import KBStorageHelper
+
+        # Set up KB directory (metadata sidecar lives here; vectors go to Chroma).
+        kb_path = await self._kb_path()
+        if not kb_path:
             msg = "Knowledge base path is not set. Please create a new knowledge base first."
             raise ValueError(msg)
-        vector_store_dir.mkdir(parents=True, exist_ok=True)
+        kb_path.mkdir(parents=True, exist_ok=True)
 
-        # Convert DataFrame to Data objects (following Local DB pattern)
-        data_objects = await self._convert_df_to_data_objects(df_source, config_list)
+        kb_id = self._get_or_create_kb_id(kb_path)
 
-        # Create vector store
+        # Create vector store keyed by the KB UUID via the remote-aware client.
+        client = KBStorageHelper.get_chroma_client(kb_path)
         chroma = Chroma(
-            persist_directory=str(vector_store_dir),
+            client=client,
             embedding_function=embedding_function,
-            collection_name=self.knowledge_base,
+            collection_name=kb_id,
         )
+
+        # Convert DataFrame to Data objects (following Local DB pattern),
+        # deduplicating against rows already stored in this collection.
+        data_objects = await self._convert_df_to_data_objects(df_source, config_list, chroma)
 
         # Convert Data objects to LangChain Documents
         documents = []
@@ -400,26 +444,21 @@ class KnowledgeIngestionComponent(Component):
         # Add documents to vector store
         if documents:
             chroma.add_documents(documents)
-            self.log(f"Added {len(documents)} documents to vector store '{self.knowledge_base}'")
+            self.log(f"Added {len(documents)} documents to vector store '{self.knowledge_base}' (collection {kb_id})")
 
         return chroma
 
     async def _convert_df_to_data_objects(
-        self, df_source: pd.DataFrame, config_list: list[dict[str, Any]]
+        self, df_source: pd.DataFrame, config_list: list[dict[str, Any]], chroma: Chroma
     ) -> list[Data]:
-        """Convert DataFrame to Data objects for vector store."""
+        """Convert DataFrame to Data objects for vector store.
+
+        ``chroma`` is the collection the documents will be written to; it is used
+        here to read existing identifiers for duplicate detection.
+        """
         data_objects: list[Data] = []
 
-        # Set up vector store directory
-        kb_path = await self._kb_path()
-
-        # If we don't allow duplicates, we need to get the existing hashes
-        chroma = Chroma(
-            persist_directory=str(kb_path),
-            collection_name=self.knowledge_base,
-        )
-
-        # Get all documents and their metadata
+        # Get all documents and their metadata from the target collection
         all_docs = chroma.get()
 
         # Extract all _id values from metadata
@@ -645,9 +684,20 @@ class KnowledgeIngestionComponent(Component):
             # so the KB modal and API show correct chunks/words/characters
             self._update_metadata_metrics(kb_path, chroma)
 
+            # Upload the metadata sidecar to S3 so a deployed agent can restore
+            # the KB definition (its UUID + embedding config) without the
+            # builder's local disk. Vectors already live in the shared Chroma.
+            kb_id = self._get_or_create_kb_id(kb_path)
+            try:
+                from langflow.api.utils.kb_helpers import KBStorageHelper
+
+                KBStorageHelper.upload_metadata_to_s3(kb_path, str(self.user_id), kb_id)
+            except Exception as e:  # noqa: BLE001
+                self.log(f"Could not upload KB metadata to S3: {e}")
+
             # Build metadata response
             meta: dict[str, Any] = {
-                "kb_id": str(uuid.uuid4()),
+                "kb_id": kb_id,
                 "kb_name": self.knowledge_base,
                 "rows": len(df_source),
                 "column_metadata": column_metadata,
