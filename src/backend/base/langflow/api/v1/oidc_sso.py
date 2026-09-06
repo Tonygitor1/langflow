@@ -2,9 +2,6 @@
 
 Adds four routes under /api/v1/login/oidc/:
 
-  GET /config     — returns {"enabled": bool} so the frontend can decide
-                    whether to show the SSO login button.
-
   GET /authorize  — begins the authorization code flow with PKCE; redirects
                     the browser to the OIDC provider.
 
@@ -14,6 +11,12 @@ Adds four routes under /api/v1/login/oidc/:
 
   GET /logout     — clears Langflow + SSO cookies and redirects the browser
                     to the provider's end-session endpoint.
+
+  POST /register  — self-service signup; creates the user in Keycloak via the
+                    Admin API, assigns the requested realm role, and sends a
+                    verification email.
+
+If the login or signup flow changes, update docs/user-registration.md.
 
 Configuration (set in .env.langflow).  Variable names align with SSOConfig
 columns so the env-var source and the DB record use the same vocabulary:
@@ -49,17 +52,18 @@ import json
 import os
 import secrets
 from datetime import datetime, timezone
-from typing import Optional
+from typing import Literal, Optional
 from urllib.parse import urlencode, urlparse, urlunparse
 
 import httpx
 from fastapi import APIRouter, HTTPException, Request, Response
 from fastapi.responses import RedirectResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, EmailStr, Field
 from sqlmodel import select
 
 from langflow.api.utils import DbSession
 from langflow.initial_setup.setup import get_or_create_default_folder
+from langflow.services.auth import keycloak_admin
 from langflow.services.database.models.auth.sso import SSOConfig, SSOUserProfile
 from langflow.services.database.models.user.crud import get_user_by_username
 from langflow.services.database.models.user.model import User
@@ -124,9 +128,18 @@ async def _fetch_discovery() -> dict:
 # ── helpers ───────────────────────────────────────────────────────────────────
 
 
-class OidcConfig(BaseModel):
-    enabled: bool
-    label: str = "Sign in with SSO"
+class RegisterRequest(BaseModel):
+    """Self-service signup payload. `role` is an alias, never a raw realm role."""
+
+    email: EmailStr
+    password: str = Field(min_length=8, max_length=128)
+    first_name: str = Field(min_length=1, max_length=64)
+    last_name: str = Field(min_length=1, max_length=64)
+    role: Literal["producer", "consumer"]
+
+
+class RegisterResponse(BaseModel):
+    email_verification_sent: bool
 
 
 class IdTokenClaims(BaseModel):
@@ -527,10 +540,25 @@ async def find_or_create_sso_user(
 # ── routes ────────────────────────────────────────────────────────────────────
 
 
-@router.get("/config", response_model=OidcConfig, include_in_schema=False)
-async def oidc_config() -> OidcConfig:
-    """Return whether OIDC SSO is configured on this server."""
-    return OidcConfig(enabled=_is_sso_configured())
+@router.post("/register", response_model=RegisterResponse, include_in_schema=False)
+async def oidc_register(payload: RegisterRequest) -> RegisterResponse:
+    """Create a Keycloak account for a new producer or consumer.
+
+    The Langflow user row is not created here — it is provisioned by the SSO
+    callback the first time the user signs in.
+    """
+    try:
+        email_sent = await keycloak_admin.register_user(
+            email=str(payload.email).strip().lower(),
+            password=payload.password,
+            first_name=payload.first_name.strip(),
+            last_name=payload.last_name.strip(),
+            role_alias=payload.role,
+        )
+    except keycloak_admin.KeycloakAdminError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc
+
+    return RegisterResponse(email_verification_sent=email_sent)
 
 
 @router.get("/authorize", include_in_schema=False)

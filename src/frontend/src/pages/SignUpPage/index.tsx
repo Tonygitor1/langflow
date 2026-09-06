@@ -1,73 +1,85 @@
 import * as Form from "@radix-ui/react-form";
-import { type FormEvent, useEffect, useState } from "react";
+import { type FormEvent, useState } from "react";
 import { useTranslation } from "react-i18next";
 import LangflowLogo from "@/assets/LangflowLogo.svg?react";
+import ForwardedIconComponent from "@/components/common/genericIconComponent";
+import ShadTooltip from "@/components/common/shadTooltipComponent";
 import InputComponent from "@/components/core/parameterRenderComponent/components/inputComponent";
-import { useAddUser } from "@/controllers/API/queries/auth";
+import { RadioGroup, RadioGroupItem } from "@/components/ui/radio-group";
+import {
+  type SsoRegisterType,
+  useSsoRegister,
+} from "@/controllers/API/queries/auth";
 import { CustomLink } from "@/customization/components/custom-link";
 import { useCustomNavigate } from "@/customization/hooks/use-custom-navigate";
 import { track } from "@/customization/utils/analytics";
 import { Button } from "../../components/ui/button";
 import { Input } from "../../components/ui/input";
-import { CONTROL_INPUT_STATE } from "../../constants/constants";
 import useAlertStore from "../../stores/alertStore";
-import type {
-  inputHandlerEventType,
-  signUpInputStateType,
-  UserInputType,
-} from "../../types/components";
+
+const MIN_PASSWORD_LENGTH = 8;
+
+// Role aliases are mapped to realm roles server-side; see docs/user-registration.md.
+const ROLE_OPTIONS = [
+  { value: "producer", labelKey: "auth.roleProducer", hintKey: "auth.roleProducerHint" },
+  { value: "consumer", labelKey: "auth.roleConsumer", hintKey: "auth.roleConsumerHint" },
+] as const;
+
+type RoleValue = (typeof ROLE_OPTIONS)[number]["value"];
+
+/** Pydantic returns `detail` as a string for HTTPException and a list for 422. */
+function readErrorDetail(error: any): string[] {
+  const detail = error?.response?.data?.detail;
+  if (Array.isArray(detail)) {
+    return detail.map((item) => item?.msg ?? String(item));
+  }
+  return [detail ?? error?.message ?? ""].filter(Boolean);
+}
 
 export default function SignUp(): JSX.Element {
-  const [inputState, setInputState] =
-    useState<signUpInputStateType>(CONTROL_INPUT_STATE);
-
-  const [isDisabled, setDisableBtn] = useState<boolean>(true);
+  const [email, setEmail] = useState<string>("");
+  const [password, setPassword] = useState<string>("");
+  const [firstName, setFirstName] = useState<string>("");
+  const [lastName, setLastName] = useState<string>("");
+  const [role, setRole] = useState<RoleValue>("producer");
 
   const { t } = useTranslation();
-  const { password, cnfPassword, username } = inputState;
   const setSuccessData = useAlertStore((state) => state.setSuccessData);
   const setErrorData = useAlertStore((state) => state.setErrorData);
   const navigate = useCustomNavigate();
 
-  const { mutate: mutateAddUser } = useAddUser();
+  const { mutate: mutateSsoRegister, isPending } = useSsoRegister();
 
-  function handleInput({
-    target: { name, value },
-  }: inputHandlerEventType): void {
-    setInputState((prev) => ({ ...prev, [name]: value }));
-  }
-
-  useEffect(() => {
-    if (password !== cnfPassword) return setDisableBtn(true);
-    if (password === "" || cnfPassword === "") return setDisableBtn(true);
-    if (username === "") return setDisableBtn(true);
-    setDisableBtn(false);
-  }, [password, cnfPassword, username, handleInput]);
+  const isDisabled =
+    isPending ||
+    email.trim() === "" ||
+    firstName.trim() === "" ||
+    lastName.trim() === "" ||
+    password.length < MIN_PASSWORD_LENGTH;
 
   function handleSignup(): void {
-    const { username, password } = inputState;
-    const newUser: UserInputType = {
-      username: username.trim(),
-      password: password.trim(),
+    const newUser: SsoRegisterType = {
+      email: email.trim(),
+      password,
+      first_name: firstName.trim(),
+      last_name: lastName.trim(),
+      role,
     };
 
-    mutateAddUser(newUser, {
-      onSuccess: (user) => {
-        track("User Signed Up", user);
+    mutateSsoRegister(newUser, {
+      onSuccess: (data) => {
+        track("User Signed Up", { role });
         setSuccessData({
-          title: t("auth.signUpSuccess"),
+          title: data.email_verification_sent
+            ? t("auth.signUpVerifyEmail")
+            : t("auth.signUpSuccess"),
         });
         navigate("/login");
       },
       onError: (error) => {
-        const {
-          response: {
-            data: { detail },
-          },
-        } = error;
         setErrorData({
           title: t("errors.signup"),
-          list: [detail],
+          list: readErrorDetail(error),
         });
       },
     });
@@ -76,18 +88,16 @@ export default function SignUp(): JSX.Element {
   return (
     <Form.Root
       onSubmit={(event: FormEvent<HTMLFormElement>) => {
-        if (password === "") {
-          event.preventDefault();
+        event.preventDefault();
+        if (isDisabled) {
           return;
         }
-
-        const _data = Object.fromEntries(new FormData(event.currentTarget));
-        event.preventDefault();
+        handleSignup();
       }}
       className="h-screen w-full"
     >
-      <div className="flex h-full w-full flex-col items-center justify-center bg-muted">
-        <div className="flex w-72 flex-col items-center justify-center gap-2">
+      <div className="flex h-full w-full flex-col items-center justify-center overflow-auto bg-muted py-10">
+        <div className="flex w-80 flex-col items-center justify-center gap-2">
           <LangflowLogo
             title="Langflow logo"
             className="mb-4 h-10 w-10 scale-[1.5]"
@@ -96,40 +106,40 @@ export default function SignUp(): JSX.Element {
             {t("auth.signupTitle")}
           </span>
           <div className="mb-3 w-full">
-            <Form.Field name="username">
+            <Form.Field name="email">
               <Form.Label className="data-[invalid]:label-invalid">
-                {t("auth.usernameLabel")}{" "}
+                {t("auth.emailLabel")}{" "}
                 <span className="font-medium text-destructive">*</span>
               </Form.Label>
 
               <Form.Control asChild>
                 <Input
-                  type="username"
-                  onChange={({ target: { value } }) => {
-                    handleInput({ target: { name: "username", value } });
-                  }}
-                  value={username}
+                  type="email"
+                  onChange={({ target: { value } }) => setEmail(value)}
+                  value={email}
                   className="w-full"
                   required
-                  placeholder={t("auth.usernamePlaceholder")}
+                  placeholder={t("auth.emailPlaceholder")}
                 />
               </Form.Control>
 
               <Form.Message match="valueMissing" className="field-invalid">
-                {t("auth.usernameRequired")}
+                {t("auth.emailRequired")}
+              </Form.Message>
+              <Form.Message match="typeMismatch" className="field-invalid">
+                {t("auth.emailInvalid")}
               </Form.Message>
             </Form.Field>
           </div>
           <div className="mb-3 w-full">
-            <Form.Field name="password" serverInvalid={password != cnfPassword}>
+            <Form.Field name="password">
               <Form.Label className="data-[invalid]:label-invalid">
                 {t("auth.passwordLabel")}{" "}
                 <span className="font-medium text-destructive">*</span>
               </Form.Label>
+
               <InputComponent
-                onChange={(value) => {
-                  handleInput({ target: { name: "password", value } });
-                }}
+                onChange={(value) => setPassword(value)}
                 value={password}
                 isForm
                 password={true}
@@ -141,40 +151,108 @@ export default function SignUp(): JSX.Element {
               <Form.Message className="field-invalid" match="valueMissing">
                 {t("auth.passwordEnterRequired")}
               </Form.Message>
-
-              {password != cnfPassword && (
+              {password !== "" && password.length < MIN_PASSWORD_LENGTH && (
                 <Form.Message className="field-invalid">
-                  {t("errors.passwordMismatch")}
+                  {t("auth.passwordTooShort", { count: MIN_PASSWORD_LENGTH })}
                 </Form.Message>
               )}
             </Form.Field>
           </div>
-          <div className="w-full">
-            <Form.Field
-              name="confirmpassword"
-              serverInvalid={password != cnfPassword}
-            >
+          <div className="mb-3 w-full">
+            <Form.Field name="firstName">
               <Form.Label className="data-[invalid]:label-invalid">
-                {t("auth.confirmPasswordLabel")}{" "}
+                {t("auth.firstNameLabel")}{" "}
                 <span className="font-medium text-destructive">*</span>
               </Form.Label>
 
-              <InputComponent
-                onChange={(value) => {
-                  handleInput({ target: { name: "cnfPassword", value } });
-                }}
-                value={cnfPassword}
-                isForm
-                password={true}
-                required
-                placeholder={t("auth.confirmPasswordPlaceholder")}
-                className="w-full"
-              />
+              <Form.Control asChild>
+                <Input
+                  type="text"
+                  onChange={({ target: { value } }) => setFirstName(value)}
+                  value={firstName}
+                  className="w-full"
+                  required
+                  placeholder={t("auth.firstNamePlaceholder")}
+                />
+              </Form.Control>
 
-              <Form.Message className="field-invalid" match="valueMissing">
-                {t("auth.confirmPasswordRequired")}
+              <Form.Message match="valueMissing" className="field-invalid">
+                {t("auth.firstNameRequired")}
               </Form.Message>
             </Form.Field>
+          </div>
+          <div className="mb-3 w-full">
+            <Form.Field name="lastName">
+              <Form.Label className="data-[invalid]:label-invalid">
+                {t("auth.lastNameLabel")}{" "}
+                <span className="font-medium text-destructive">*</span>
+              </Form.Label>
+
+              <Form.Control asChild>
+                <Input
+                  type="text"
+                  onChange={({ target: { value } }) => setLastName(value)}
+                  value={lastName}
+                  className="w-full"
+                  required
+                  placeholder={t("auth.lastNamePlaceholder")}
+                />
+              </Form.Control>
+
+              <Form.Message match="valueMissing" className="field-invalid">
+                {t("auth.lastNameRequired")}
+              </Form.Message>
+            </Form.Field>
+          </div>
+          <div className="w-full">
+            <Form.Label className="data-[invalid]:label-invalid">
+              {t("auth.roleLabel")}{" "}
+              <span className="font-medium text-destructive">*</span>
+            </Form.Label>
+
+            <RadioGroup
+              className="mt-2 gap-2"
+              value={role}
+              onValueChange={(value) => setRole(value as RoleValue)}
+            >
+              {ROLE_OPTIONS.map((option) => (
+                <div
+                  key={option.value}
+                  className="flex items-center justify-between gap-2"
+                >
+                  <div className="flex items-center gap-2">
+                    <RadioGroupItem
+                      value={option.value}
+                      id={`role-${option.value}`}
+                      data-testid={`role-${option.value}`}
+                    />
+                    <label
+                      htmlFor={`role-${option.value}`}
+                      className="cursor-pointer text-sm text-primary"
+                    >
+                      {t(option.labelKey)}
+                    </label>
+                  </div>
+                  <ShadTooltip
+                    content={t(option.hintKey)}
+                    side="right"
+                    delayDuration={100}
+                  >
+                    <button
+                      type="button"
+                      aria-label={t(option.hintKey)}
+                      className="text-muted-foreground hover:text-primary"
+                      data-testid={`role-${option.value}-help`}
+                    >
+                      <ForwardedIconComponent
+                        name="CircleHelp"
+                        className="h-4 w-4"
+                      />
+                    </button>
+                  </ShadTooltip>
+                </div>
+              ))}
+            </RadioGroup>
           </div>
           <div className="w-full">
             <Form.Submit asChild>
@@ -182,9 +260,6 @@ export default function SignUp(): JSX.Element {
                 disabled={isDisabled}
                 type="submit"
                 className="mr-3 mt-6 w-full"
-                onClick={() => {
-                  handleSignup();
-                }}
               >
                 {t("auth.signupButton")}
               </Button>
@@ -192,7 +267,7 @@ export default function SignUp(): JSX.Element {
           </div>
           <div className="w-full">
             <CustomLink to="/login">
-              <Button className="w-full" variant="outline">
+              <Button className="w-full" variant="outline" type="button">
                 {t("auth.haveAccount")}&nbsp;<b>{t("auth.signInLink")}</b>
               </Button>
             </CustomLink>

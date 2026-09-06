@@ -9,3 +9,4 @@ export * from "./use-post-add-user";
 export * from "./use-post-login-user";
 export * from "./use-post-logout";
 export * from "./use-post-refresh-access";
+export * from "./use-post-sso-register";
