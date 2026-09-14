@@ -1,13 +1,16 @@
 import { useEffect } from "react";
 import { useTranslation } from "react-i18next";
 import LangflowLogo from "@/assets/LangflowLogo.svg?react";
-import { CustomLink } from "@/customization/components/custom-link";
 import { useSanitizeRedirectUrl } from "@/hooks/use-sanitize-redirect-url";
 import { Button } from "../../components/ui/button";
 import useAlertStore from "../../stores/alertStore";
 
-// Keycloak SSO is the only supported sign-in path for the builder.
+// Keycloak SSO is the only supported sign-in path for the builder, and only
+// producers/admins get in. Consumers and signup belong to the marketplace; the
+// backend knows its URL and redirects.
 const SSO_AUTHORIZE_URL = "/api/v1/login/oidc/authorize";
+const MARKETPLACE_LOGIN_URL = "/api/v1/login/oidc/marketplace?path=login";
+const MARKETPLACE_SIGNUP_URL = "/api/v1/login/oidc/marketplace?path=signup";
 
 export default function LoginPage(): JSX.Element {
   useSanitizeRedirectUrl();
@@ -62,16 +65,35 @@ export default function LoginPage(): JSX.Element {
               window.location.assign(SSO_AUTHORIZE_URL);
             }}
           >
-            {t("auth.signInButton")}
+            {t("auth.signInAsProducer")}
           </Button>
         </div>
         <div className="w-full">
-          <CustomLink to="/signup">
-            <Button className="w-full" variant="outline" type="button">
-              {t("auth.noAccount")}&nbsp;<b>{t("auth.signUpLink")}</b>
-            </Button>
-          </CustomLink>
+          <Button
+            className="w-full"
+            variant="outline"
+            type="button"
+            data-testid="marketplace-login-btn"
+            onClick={() => {
+              window.location.assign(MARKETPLACE_LOGIN_URL);
+            }}
+          >
+            {t("auth.signInAsConsumer")}
+          </Button>
         </div>
+        <p className="mt-4 text-sm text-muted-foreground">
+          {t("auth.noAccount")}{" "}
+          <button
+            type="button"
+            className="font-semibold text-primary underline-offset-4 hover:underline"
+            data-testid="marketplace-signup-btn"
+            onClick={() => {
+              window.location.assign(MARKETPLACE_SIGNUP_URL);
+            }}
+          >
+            {t("auth.signUpLink")}
+          </button>
+        </p>
       </div>
     </div>
   );

@@ -48,8 +48,6 @@ const DeleteAccountPage = lazy(() => import("./pages/DeleteAccountPage"));
 
 const PlaygroundPage = lazy(() => import("./pages/Playground"));
 
-const SignUp = lazy(() => import("./pages/SignUpPage"));
-
 const router = createBrowserRouter(
   createRoutesFromElements([
     <Route path="/playground/:id/">
@@ -198,14 +196,6 @@ const router = createBrowserRouter(
             element={
               <ProtectedLoginRoute>
                 <LoginPage />
-              </ProtectedLoginRoute>
-            }
-          />
-          <Route
-            path="signup"
-            element={
-              <ProtectedLoginRoute>
-                <SignUp />
               </ProtectedLoginRoute>
             }
           />

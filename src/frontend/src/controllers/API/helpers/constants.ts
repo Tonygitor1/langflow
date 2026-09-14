@@ -14,7 +14,6 @@ export const URLs = {
   USERS: "users",
   LOGOUT: `logout`,
   LOGIN: `login`,
-  SSO_REGISTER: `login/oidc/register`,
   SESSION: `session`,
   AUTOLOGIN: "auto_login",
   REFRESH: "refresh",
