@@ -6,6 +6,57 @@ This file provides guidance to AI coding agents when working with code in this r
 
 Langflow is a visual workflow builder for AI-powered agents. It has a Python/FastAPI backend, React/TypeScript frontend, and a lightweight executor CLI (lfx).
 
+## This fork — Agent Marketplace
+
+This repo is a fork. `main` tracks upstream; all marketplace work lands on
+**`v1.9.1-market`**, which is the base for feature branches and PRs here. The
+platform that surrounds this builder lives in the sibling repo
+`0to1-agents-market` — read its `CLAUDE.md` first.
+
+**Keep docs in sync with the code.** Behaviour described in a doc must be
+updated in the same commit, here or in the sibling repo. Write docs short and
+precise: simple words, easy to understand.
+
+### Auth (differs from upstream)
+
+- The builder is **Keycloak SSO only**. Upstream's username/password form and
+  the `/signup` page are removed; `/login` offers **Sign in as producer**
+  (`/api/v1/login/oidc/authorize`), **Sign in as consumer** and **Sign Up**.
+- The last two go through `GET /api/v1/login/oidc/marketplace?path=login|signup`,
+  which redirects to `AGENTS_MARKET_FRONTEND_URL`. `path` is allowlisted, so the
+  route cannot be used as an open redirect. **Signup lives in the marketplace**,
+  never here.
+- Only the realm roles in `oidc_sso._ALLOWED_ROLES` (`agent_producer`,
+  `platform_admin`) may enter the builder. Anyone else is signed back out of
+  Keycloak and returned to `/login` with an `sso_error` cookie.
+- **Logout must hit the backend.** `refresh_token_lf` is HttpOnly, so clearing
+  cookies in the browser leaves it in place and the next `/refresh` silently
+  mints a new access token for the user who just logged out. SSO sessions then
+  also go to `/api/v1/login/oidc/logout` to end the Keycloak session.
+- Deleting an auth cookie requires the **same attributes it was set with**
+  (`httponly`, `samesite`, `secure`, `domain`), or the browser keeps it.
+- `sso_provider` / `kc_id_token` live for the refresh-token lifetime, not the
+  access-token lifetime: logout needs them to detect an SSO session and to pass
+  `id_token_hint`.
+
+### Local (k3s) development
+
+`docker/local_backend.Dockerfile` is the dev image: source is mounted at `/app`,
+and the uv venv + cache live at `/uv` (a PVC) — not in the mounted source, which
+cannot do uv's atomic renames, and not in `/tmp`, which is wiped on restart.
+Cluster setup, ports and troubleshooting are in
+`0to1-agents-market/deployment/local/LOCAL_DEV.md`.
+
+### Sibling-repo docs
+
+| Topic | Doc |
+|---|---|
+| Signup, roles, `POST /api/auth/register` | `0to1-agents-market/docs/user-registration.md` |
+| Keycloak realm import, client secrets, reset script | `0to1-agents-market/docs/keycloak-realm.md` |
+| Verification email (SES) | `0to1-agents-market/docs/ses-email.md` |
+| Token → LiteLLM key chain (why the `basic` scope matters) | `0to1-agents-market/docs/litellm-key-resolution.md` |
+| Publish → deploy pipeline | `0to1-agents-market/docs/publish-deploy-ux.md` |
+
 ## Prerequisites
 
 - **Python:** 3.10-3.13
