@@ -2,9 +2,6 @@
 
 Adds four routes under /api/v1/login/oidc/:
 
-  GET /config     — returns {"enabled": bool} so the frontend can decide
-                    whether to show the SSO login button.
-
   GET /authorize  — begins the authorization code flow with PKCE; redirects
                     the browser to the OIDC provider.
 
@@ -15,6 +12,12 @@ Adds four routes under /api/v1/login/oidc/:
   GET /logout     — clears Langflow + SSO cookies and redirects the browser
                     to the provider's end-session endpoint.
 
+  GET /marketplace?path=login|signup
+                  — hands off to the marketplace, which owns consumer sign-in
+                    and all signup.
+
+Signup lives in the marketplace, not here — see docs/user-registration.md.
+
 Configuration (set in .env.langflow).  Variable names align with SSOConfig
 columns so the env-var source and the DB record use the same vocabulary:
 
@@ -23,7 +26,8 @@ columns so the env-var source and the DB record use the same vocabulary:
   LANGFLOW_INITIAL_SSO_CLIENT_ID        client id           (SSOConfig.client_id)
   LANGFLOW_INITIAL_SSO_CLIENT_SECRET    client secret       (SSOConfig.client_secret_encrypted)
   LANGFLOW_INITIAL_SSO_SCOPES           space-separated     (SSOConfig.scopes, default: openid profile email)
-  AGENTS_MARKET_FRONTEND_URL            marketplace frontend, default http://localhost:3000
+  AGENTS_MARKET_FRONTEND_URL            marketplace frontend (signup redirect),
+                                        default http://localhost:3001
 
 On the first SSO request the env vars (plus endpoints fetched from the
 discovery document) are written into the sso_config table so the
@@ -31,8 +35,8 @@ configuration is visible to platform admins without inspecting env vars.
 
 Role-based access:
   Only users with the realm role "agent_producer" or "platform_admin" may
-  access the Langflow builder.  Users whose only role is "agent_consumer"
-  are redirected to AGENTS_MARKET_FRONTEND_URL.
+  access the Langflow builder.  Everyone else is signed back out of Keycloak
+  and returned to /login with an access-denied message.
 
 User identity tracking:
   A SSOUserProfile row is created / updated on every successful login,
@@ -72,6 +76,9 @@ _PLACEHOLDER_SECRET = "REPLACE_WITH_CLIENT_SECRET"
 
 # Realm roles that are allowed to access the Langflow builder
 _ALLOWED_ROLES = {"agent_producer", "platform_admin"}
+
+# Marketplace pages the builder is allowed to hand off to.
+_MARKETPLACE_PATHS = {"login", "signup"}
 
 # Module-level caches: seeded lazily on the first SSO request.
 _sso_config_seeded: bool = False
@@ -122,11 +129,6 @@ async def _fetch_discovery() -> dict:
 
 
 # ── helpers ───────────────────────────────────────────────────────────────────
-
-
-class OidcConfig(BaseModel):
-    enabled: bool
-    label: str = "Sign in with SSO"
 
 
 class IdTokenClaims(BaseModel):
@@ -527,10 +529,17 @@ async def find_or_create_sso_user(
 # ── routes ────────────────────────────────────────────────────────────────────
 
 
-@router.get("/config", response_model=OidcConfig, include_in_schema=False)
-async def oidc_config() -> OidcConfig:
-    """Return whether OIDC SSO is configured on this server."""
-    return OidcConfig(enabled=_is_sso_configured())
+@router.get("/marketplace", include_in_schema=False)
+async def oidc_marketplace(path: str = "login") -> RedirectResponse:
+    """Hand off to the marketplace, which owns consumer sign-in and all signup.
+
+    `path` is allowlisted rather than passed through, so this cannot be used as
+    an open redirect.
+    """
+    if path not in _MARKETPLACE_PATHS:
+        raise HTTPException(status_code=400, detail="Unsupported marketplace path.")
+    base = os.getenv("AGENTS_MARKET_FRONTEND_URL", "http://localhost:3001").rstrip("/")
+    return RedirectResponse(url=f"{base}/{path}", status_code=302)
 
 
 @router.get("/authorize", include_in_schema=False)
@@ -712,13 +721,16 @@ async def oidc_callback(
             expires=auth_settings.REFRESH_TOKEN_EXPIRE_SECONDS,
             domain=auth_settings.COOKIE_DOMAIN,
         )
+    # These two outlive the access token on purpose: the session survives for the
+    # refresh-token lifetime, and logout needs them to spot an SSO session and to
+    # pass id_token_hint. Expiring them sooner leaves the Keycloak session open.
     final.set_cookie(
         "sso_provider",
         provider_name,
         httponly=False,
         samesite="lax",
         secure=auth_settings.ACCESS_SECURE,
-        expires=auth_settings.ACCESS_TOKEN_EXPIRE_SECONDS,
+        expires=auth_settings.REFRESH_TOKEN_EXPIRE_SECONDS,
     )
     if id_token:
         final.set_cookie(
@@ -727,7 +739,7 @@ async def oidc_callback(
             httponly=False,
             samesite="lax",
             secure=auth_settings.ACCESS_SECURE,
-            expires=auth_settings.ACCESS_TOKEN_EXPIRE_SECONDS,
+            expires=auth_settings.REFRESH_TOKEN_EXPIRE_SECONDS,
         )
     return final
 
@@ -754,8 +766,29 @@ async def oidc_logout(request: Request) -> RedirectResponse:
     logout_url = _rewrite_url_origin(f"{end_session_endpoint}?{urlencode(params)}")
 
     resp = RedirectResponse(url=logout_url, status_code=302)
+    auth_settings = get_settings_service().auth_settings
     resp.delete_cookie("sso_provider")
     resp.delete_cookie("kc_id_token")
-    resp.delete_cookie("access_token_lf")
-    resp.delete_cookie("refresh_token_lf")
+    # Attributes must match the ones used to set these, or the browser keeps them.
+    resp.delete_cookie(
+        "access_token_lf",
+        httponly=auth_settings.ACCESS_HTTPONLY,
+        samesite=auth_settings.ACCESS_SAME_SITE,
+        secure=auth_settings.ACCESS_SECURE,
+        domain=auth_settings.COOKIE_DOMAIN,
+    )
+    resp.delete_cookie(
+        "refresh_token_lf",
+        httponly=auth_settings.REFRESH_HTTPONLY,
+        samesite=auth_settings.REFRESH_SAME_SITE,
+        secure=auth_settings.REFRESH_SECURE,
+        domain=auth_settings.COOKIE_DOMAIN,
+    )
+    resp.delete_cookie(
+        "apikey_tkn_lflw",
+        httponly=auth_settings.ACCESS_HTTPONLY,
+        samesite=auth_settings.ACCESS_SAME_SITE,
+        secure=auth_settings.ACCESS_SECURE,
+        domain=auth_settings.COOKIE_DOMAIN,
+    )
     return resp

@@ -2,8 +2,9 @@
 #
 # Lightweight dev image for local k3s development.
 # - Source code is mounted at /app via a hostPath PersistentVolume at runtime
-# - .venv is created inside the mounted source (langflow/.venv on the host)
-#   by make backend_local on first run — it persists across restarts
+# - The uv venv and cache live at /uv (langflow-uv-pvc), NOT in the mounted
+#   source: the 9p mount can't do uv's atomic renames, and they must outlive
+#   the container or `uv sync` re-downloads every wheel on each restart
 # - Frontend runs on the host (localhost:3000), not in this container
 #
 # Build:
