@@ -34,13 +34,26 @@ discovery document) are written into the sso_config table so the
 configuration is visible to platform admins without inspecting env vars.
 
 Role-based access:
-  Only users with the realm role "agent_producer" or "platform_admin" may
+  Only users with the realm role "agent_producer", "platform_developer" or
+  "platform_admin" — or the org role admin/producer in some organization — may
   access the Langflow builder.  Everyone else is signed back out of Keycloak
-  and returned to /login with an access-denied message.
+  and returned to /login with an access-denied message.  An account that has
+  picked no role at all yet is instead sent to the marketplace's /onboarding
+  screen, which is the place that can fix it.
+
+Organization profiles:
+  A user acts either personally or inside one organization, and each profile is
+  its own Langflow user row ("alice@x.com#acme").  Flows, folders and the
+  LITELLM_KEY variable are already scoped by user_id, so this keeps the two
+  apart without touching a single query, and gives each profile its own LiteLLM
+  key.  Switching profile re-runs /authorize with ?org_id=, so membership is
+  re-checked against a freshly minted token every time rather than trusted from
+  anything the browser holds.
+  See 0to1-agents-market/docs/organizations-and-roles.md.
 
 User identity tracking:
   A SSOUserProfile row is created / updated on every successful login,
-  linking the Langflow user.id to the stable provider sub claim.  On
+  linking the Langflow user.id to the stable provider sub claim (per profile).  On
   subsequent logins the user is resolved via the SSOUserProfile first,
   so provider-side username changes do not create duplicate Langflow accounts.
 """
@@ -74,11 +87,72 @@ router = APIRouter(tags=["SSO"], prefix="/login/oidc")
 
 _PLACEHOLDER_SECRET = "REPLACE_WITH_CLIENT_SECRET"
 
-# Realm roles that are allowed to access the Langflow builder
-_ALLOWED_ROLES = {"agent_producer", "platform_admin"}
+# Realm roles that are allowed to access the Langflow builder personally.
+_ALLOWED_ROLES = {"agent_producer", "platform_admin", "platform_developer"}
+
+# Every realm role this platform assigns. A token carrying none of them belongs
+# to an account that hasn't picked a role yet, which is a different problem from
+# being denied — see oidc_callback.
+_KNOWN_REALM_ROLES = _ALLOWED_ROLES | {
+    "agent_consumer",
+    "platform_reviewer",
+}
+
+# Org roles that are allowed to access the builder under that org's profile.
+_ORG_BUILDER_ROLES = {"admin", "producer"}
+
+# Organization membership arrives as Keycloak group paths /orgs/<org-id>/<role>.
+_ORG_GROUP_ROOT = "orgs"
+_ORG_ROLES = ("admin", "producer", "consumer", "billing_manager")
+
+# Separates the email from the org in a scoped Langflow username. Chosen because
+# Keycloak forbids it in a username, so it can never occur in the email half.
+SCOPE_SEPARATOR = "#"
 
 # Marketplace pages the builder is allowed to hand off to.
 _MARKETPLACE_PATHS = {"login", "signup"}
+
+
+def parse_org_groups(groups: list[str] | None) -> dict[str, set[str]]:
+    """Map Keycloak group paths to {org_id: {org_role, ...}}."""
+    out: dict[str, set[str]] = {}
+    for path in groups or []:
+        parts = [p for p in str(path).split("/") if p]
+        if len(parts) < 2 or parts[0] != _ORG_GROUP_ROOT:
+            continue
+        roles = out.setdefault(parts[1], set())
+        if len(parts) >= 3 and parts[2] in _ORG_ROLES:
+            roles.add(parts[2])
+    return out
+
+
+def scoped_username(username: str, org_id: str | None) -> str:
+    """The Langflow username for `username` acting under `org_id`."""
+    return f"{username}{SCOPE_SEPARATOR}{org_id}" if org_id else username
+
+
+def split_scoped_username(scoped: str) -> tuple[str, str | None]:
+    """Inverse of scoped_username: (username, org_id)."""
+    if SCOPE_SEPARATOR not in scoped:
+        return scoped, None
+    username, _, org_id = scoped.rpartition(SCOPE_SEPARATOR)
+    return username, org_id or None
+
+
+def builder_profiles(realm_roles: set[str], orgs: dict[str, set[str]]) -> list[str | None]:
+    """Profiles this identity may open the builder under, personal first.
+
+    None is the personal profile. An empty result means "no builder access".
+    """
+    profiles: list[str | None] = []
+    if realm_roles & _ALLOWED_ROLES:
+        profiles.append(None)
+    profiles.extend(
+        org_id
+        for org_id, roles in sorted(orgs.items())
+        if roles & _ORG_BUILDER_ROLES
+    )
+    return profiles
 
 # Module-level caches: seeded lazily on the first SSO request.
 _sso_config_seeded: bool = False
@@ -191,6 +265,12 @@ def _realm_roles_from_token(access_token: str) -> set[str]:
     return set(payload.get("realm_access", {}).get("roles", []))
 
 
+def _org_groups_from_token(access_token: str) -> dict[str, set[str]]:
+    """Organization membership from the token's `groups` claim."""
+    payload = _decode_jwt_payload(access_token)
+    return parse_org_groups(payload.get("groups"))
+
+
 
 async def _ensure_sso_config(db) -> None:
     """Lazily seed one SSOConfig row from env vars on the first SSO request.
@@ -241,12 +321,18 @@ async def _upsert_sso_profile(
     provider_name: str,
     sub_claim: str,
     email: str | None,
+    scope: str = "",
 ) -> None:
-    """Create or update the SSOUserProfile for a successful login."""
+    """Create or update the SSOUserProfile for a successful login.
+
+    `scope` is the org id the login is scoped to ("" for personal): one provider
+    identity has one profile row per profile it can act under.
+    """
     result = await db.exec(
         select(SSOUserProfile).where(
             SSOUserProfile.sso_provider == provider_name,
             SSOUserProfile.sso_user_id == sub_claim,
+            SSOUserProfile.sso_scope == scope,
         )
     )
     profile = result.first()
@@ -267,6 +353,7 @@ async def _upsert_sso_profile(
             user_id=user_id,
             sso_provider=provider_name,
             sso_user_id=sub_claim,
+            sso_scope=scope,
             email=email,
             sso_last_login_at=now,
         )
@@ -466,6 +553,7 @@ async def find_or_create_sso_user(
     email: str | None,
     is_platform_admin: bool,
     provider_name: str,
+    org_id: str | None = None,
     sync_litellm: bool = True,
 ) -> User:
     """Find or create a Langflow User for an external SSO identity.
@@ -475,14 +563,21 @@ async def find_or_create_sso_user(
     executor calls to lazily provision consumer users who are blocked
     from ever logging into the builder (see _ALLOWED_ROLES) and so would
     otherwise never get a Langflow User row or a LITELLM_KEY.
+
+    `org_id` selects the profile. Each profile is a separate User row, so the
+    caller's flows, folders and LITELLM_KEY are isolated per profile; the
+    caller is responsible for having checked membership first.
     """
     auth = get_auth_service()
+    scope = org_id or ""
+    lf_username = scoped_username(username, org_id)
 
-    # Primary: resolve via SSOUserProfile (stable sub → Langflow user.id link).
+    # Primary: resolve via SSOUserProfile (stable sub + profile → user.id link).
     result = await db.exec(
         select(SSOUserProfile).where(
             SSOUserProfile.sso_provider == provider_name,
             SSOUserProfile.sso_user_id == sub_claim,
+            SSOUserProfile.sso_scope == scope,
         )
     )
     sso_profile = result.first()
@@ -494,11 +589,11 @@ async def find_or_create_sso_user(
             sso_profile = None
 
     if user is None:
-        user = await get_user_by_username(db, username)
+        user = await get_user_by_username(db, lf_username)
 
     if user is None:
         user = User(
-            username=username,
+            username=lf_username,
             # Random password — SSO users never authenticate with it directly.
             password=auth.get_password_hash(secrets.token_urlsafe(32)),
             is_active=True,
@@ -517,11 +612,20 @@ async def find_or_create_sso_user(
     if not user.is_active:
         raise HTTPException(status_code=403, detail="Your account is inactive. Contact a platform administrator.")
 
-    await _upsert_sso_profile(db, user_id=str(user.id), provider_name=provider_name, sub_claim=sub_claim, email=email)
+    await _upsert_sso_profile(
+        db,
+        user_id=str(user.id),
+        provider_name=provider_name,
+        sub_claim=sub_claim,
+        email=email,
+        scope=scope,
+    )
 
     # Sync non-admin users to LiteLLM on first login so they get a personal API key.
+    # Keyed on the scoped username, so an org profile gets its own key and its
+    # spend never lands on the personal one.
     if sync_litellm and username != "admin" and not getattr(user, "synced_llm", False):
-        await _sync_user_to_litellm(db, user, username)
+        await _sync_user_to_litellm(db, user, lf_username)
 
     return user
 
@@ -543,8 +647,16 @@ async def oidc_marketplace(path: str = "login") -> RedirectResponse:
 
 
 @router.get("/authorize", include_in_schema=False)
-async def oidc_authorize(request: Request, db: DbSession) -> RedirectResponse:
-    """Redirect the browser to the OIDC provider to begin the authorization code flow."""
+async def oidc_authorize(
+    request: Request, db: DbSession, org_id: Optional[str] = None
+) -> RedirectResponse:
+    """Redirect the browser to the OIDC provider to begin the authorization code flow.
+
+    `org_id` asks to land in that organization's profile. It is only a request:
+    the callback checks it against the token Keycloak actually issues. Switching
+    profile re-enters here, which is a silent redirect while the Keycloak session
+    is alive.
+    """
     _, _, client_id, _, scopes = _get_initial_sso_env()
     if not _is_sso_configured():
         raise HTTPException(status_code=501, detail="SSO is not configured on this server.")
@@ -562,6 +674,7 @@ async def oidc_authorize(request: Request, db: DbSession) -> RedirectResponse:
         "csrf": csrf_token,
         "verifier": verifier,
         "return_to": _frontend_origin(request),
+        "org_id": org_id or "",
     })
 
     params = urlencode({
@@ -636,10 +749,28 @@ async def oidc_callback(
     access_token = kc_tokens.get("access_token", "")
     id_token = kc_tokens.get("id_token", "")
 
-    # Role-based access: only agent_producer and platform_admin may use the builder.
+    # Role-based access: personal access needs a builder realm role, an org
+    # profile needs admin/producer in that org. No usable profile ends the
+    # Keycloak session rather than leaving a half-logged-in browser.
     realm_roles = _realm_roles_from_token(access_token)
-    if not realm_roles.intersection(_ALLOWED_ROLES):
-        error_msg = "Access denied: your account does not have permission to use the Langflow builder."
+    orgs = _org_groups_from_token(access_token)
+    profiles = builder_profiles(realm_roles, orgs)
+    requested_org = (state_data.get("org_id") or "") or None
+    denied = not profiles or (requested_org is not None and requested_org not in profiles)
+
+    # An account that has picked no role yet isn't denied, it's unfinished —
+    # send it to the marketplace onboarding screen, keeping the Keycloak
+    # session so the user doesn't have to sign in twice.
+    if denied and not realm_roles.intersection(_KNOWN_REALM_ROLES):
+        base = os.getenv("AGENTS_MARKET_FRONTEND_URL", "http://localhost:3001").rstrip("/")
+        return RedirectResponse(url=f"{base}/onboarding", status_code=302)
+
+    if denied:
+        error_msg = (
+            f"Access denied: your account has no producer role in '{requested_org}'."
+            if profiles and requested_org
+            else "Access denied: your account does not have permission to use the Langflow builder."
+        )
         logout_params: dict[str, str] = {
             "client_id": client_id,
             "post_logout_redirect_uri": f"{return_to}/login",
@@ -653,6 +784,9 @@ async def oidc_callback(
         resp = RedirectResponse(url=logout_url, status_code=302)
         resp.set_cookie("sso_error", error_msg, httponly=False, samesite="lax", max_age=60)
         return resp
+
+    # Requested profile when allowed, else the first one they do have.
+    active_org = requested_org if requested_org is not None else profiles[0]
 
     # Try to fetch userinfo from the provider; fall back to id_token claims.
     userinfo: dict = {}
@@ -695,6 +829,7 @@ async def oidc_callback(
         email=email,
         is_platform_admin=is_platform_admin,
         provider_name=provider_name,
+        org_id=active_org,
     )
 
     lf_tokens = await auth.create_user_tokens(user_id=user.id, db=db, update_last_login=True)
@@ -741,6 +876,21 @@ async def oidc_callback(
             secure=auth_settings.ACCESS_SECURE,
             expires=auth_settings.REFRESH_TOKEN_EXPIRE_SECONDS,
         )
+    # Readable by the frontend so the profile switcher can render without an
+    # extra round trip. Display only — tampering with it buys nothing, because
+    # /authorize re-derives the allowed profiles from a fresh Keycloak token.
+    # base64 so the JSON survives cookie quoting rules intact.
+    profiles_payload = json.dumps(
+        {"active": active_org or "", "available": [p or "" for p in profiles]}
+    )
+    final.set_cookie(
+        "sso_profiles",
+        base64.urlsafe_b64encode(profiles_payload.encode()).decode(),
+        httponly=False,
+        samesite="lax",
+        secure=auth_settings.ACCESS_SECURE,
+        expires=auth_settings.REFRESH_TOKEN_EXPIRE_SECONDS,
+    )
     return final
 
 
@@ -769,6 +919,7 @@ async def oidc_logout(request: Request) -> RedirectResponse:
     auth_settings = get_settings_service().auth_settings
     resp.delete_cookie("sso_provider")
     resp.delete_cookie("kc_id_token")
+    resp.delete_cookie("sso_profiles")
     # Attributes must match the ones used to set these, or the browser keeps them.
     resp.delete_cookie(
         "access_token_lf",

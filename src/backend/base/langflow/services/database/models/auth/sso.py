@@ -23,7 +23,17 @@ class SSOUserProfile(SQLModel, table=True):  # type: ignore[call-arg]
 
     __tablename__ = "sso_user_profile"
     # Use Index(unique=True) to match migration (create_index); avoids model/DB mismatch.
-    __table_args__ = (Index("uq_sso_user_profile_provider_user", "sso_provider", "sso_user_id", unique=True),)
+    # sso_scope is part of the key: one provider identity has one row per
+    # profile it acts under ("" personal, else the org id).
+    __table_args__ = (
+        Index(
+            "uq_sso_user_profile_provider_user",
+            "sso_provider",
+            "sso_user_id",
+            "sso_scope",
+            unique=True,
+        ),
+    )
 
     id: UUIDstr = Field(default_factory=uuid4, primary_key=True)
     user_id: UUIDstr = Field(
@@ -37,6 +47,7 @@ class SSOUserProfile(SQLModel, table=True):  # type: ignore[call-arg]
     )
     sso_provider: str = Field()
     sso_user_id: str = Field()
+    sso_scope: str = Field(default="", sa_column=Column(sa.String(), nullable=False, server_default=""))
     email: str | None = Field(default=None, index=True)
     sso_last_login_at: datetime | None = Field(default=None)
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))

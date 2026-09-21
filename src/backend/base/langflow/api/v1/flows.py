@@ -39,6 +39,7 @@ from langflow.api.v1.flows_helpers import (
     _verify_fs_path,
 )
 from langflow.api.v1.mappers.deployments.sync import retry_flow_operation_on_deployment_guard
+from langflow.api.v1.oidc_sso import split_scoped_username
 from langflow.api.v1.schemas import FlowListCreate
 from langflow.helpers.user import get_user_by_flow_id_or_endpoint_name
 from langflow.initial_setup.constants import STARTER_FOLDER_NAME
@@ -671,25 +672,35 @@ async def deploy_to_marketplace(
         raise HTTPException(status_code=422, detail="Flow has no graph data — build it before deploying")
 
     executor_base = os.getenv("MARKETPLACE_SERVICE_BASE_URL", "http://localhost:8014")
+    # The builder session already fixes the profile, so the org comes off the
+    # username rather than a client-supplied header — the two can't disagree.
+    owner_email, org_id = split_scoped_username(current_user.username)
     payload = {
         "agent_id": str(flow_id),
         # Forward the producer's email as the deployment owner. In this
         # Keycloak realm preferred_username == email, and SSO stores it as the
         # Langflow username — the marketplace keys its users table on it.
-        "username": current_user.username,
+        "username": owner_email,
+        # None when the flow was built under the producer's personal profile.
+        "org_id": org_id,
         "flow_id": str(flow_id),
         "flow_name": flow.name,
         "graph_data": flow.data,
         "a2a_config": body.a2a_config.model_dump(),
         # KB metadata sidecars for any knowledge bases the flow references, so
         # the agent container can restore them locally (vectors already live in
-        # the shared Chroma service, keyed by each KB's UUID).
+        # the shared Chroma service, keyed by each KB's UUID). Keyed on the
+        # scoped username: knowledge bases belong to the profile that built them.
         "knowledge_bases": _collect_kb_bootstrap(flow.data, current_user.username),
     }
 
     try:
         async with httpx.AsyncClient(timeout=120.0) as client:
-            resp = await client.post(f"{executor_base}/deploy", json=payload)
+            resp = await client.post(
+                f"{executor_base}/deploy",
+                json=payload,
+                headers={"x-org-id": org_id} if org_id else None,
+            )
     except httpx.HTTPError as exc:
         _logger.exception("executor /deploy unreachable for flow %s", flow_id)
         raise HTTPException(status_code=502, detail=f"executor unreachable: {exc}") from exc

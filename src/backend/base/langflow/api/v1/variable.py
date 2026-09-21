@@ -542,6 +542,8 @@ class EnsureUserRequest(BaseModel):
 
     ``sub`` is a stable external identity — the Keycloak ``sub`` claim for
     real users, or any stable synthetic id for local-dev bypass callers.
+    ``org_id`` picks the caller's profile; each profile is its own Langflow
+    user and so has its own LITELLM_KEY.
     """
 
     sub: str
@@ -549,6 +551,7 @@ class EnsureUserRequest(BaseModel):
     email: str | None = None
     is_platform_admin: bool = False
     provider_name: str = "keycloak"
+    org_id: str | None = None
 
 
 @router.post("/internal/ensure-user", status_code=200, include_in_schema=False)
@@ -575,6 +578,7 @@ async def ensure_internal_user(
         email=req.email,
         is_platform_admin=req.is_platform_admin,
         provider_name=req.provider_name,
+        org_id=req.org_id,
     )
 
     variable_service = get_variable_service()
