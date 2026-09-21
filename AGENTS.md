@@ -26,9 +26,20 @@ precise: simple words, easy to understand.
   which redirects to `AGENTS_MARKET_FRONTEND_URL`. `path` is allowlisted, so the
   route cannot be used as an open redirect. **Signup lives in the marketplace**,
   never here.
-- Only the realm roles in `oidc_sso._ALLOWED_ROLES` (`agent_producer`,
-  `platform_admin`) may enter the builder. Anyone else is signed back out of
-  Keycloak and returned to `/login` with an `sso_error` cookie.
+- Builder access is decided by `oidc_sso.builder_profiles()`: the realm roles
+  `agent_producer` / `platform_developer` / `platform_admin` grant the personal
+  profile, and admin/producer in an `/orgs/<id>` group grants that org's
+  profile. Anyone with no profile at all is signed back out of Keycloak and
+  returned to `/login` with an `sso_error` cookie.
+- **Organization profiles.** A user acts personally or inside one org, and each
+  profile is its own Langflow `User` row (`alice@x.com#acme`). Flows, folders
+  and variables are already scoped by `user_id`, so this isolates profiles with
+  no query changes, and each profile gets its own `LITELLM_KEY`. Switching
+  re-enters `/api/v1/login/oidc/authorize?org_id=`, so membership is re-checked
+  against a fresh token rather than trusted from the browser. Use
+  `split_scoped_username()` before sending a username to another service —
+  the marketplace keys its `users` table on the plain email.
+  See `0to1-agents-market/docs/organizations-and-roles.md`.
 - **Logout must hit the backend.** `refresh_token_lf` is HttpOnly, so clearing
   cookies in the browser leaves it in place and the next `/refresh` silently
   mints a new access token for the user who just logged out. SSO sessions then
@@ -38,6 +49,9 @@ precise: simple words, easy to understand.
 - `sso_provider` / `kc_id_token` live for the refresh-token lifetime, not the
   access-token lifetime: logout needs them to detect an SSO session and to pass
   `id_token_hint`.
+- `sso_profiles` is readable by the frontend (the org switcher renders from it)
+  and is **display only**. A cookie value containing base64 padding gets quoted
+  by the server, so strip surrounding quotes when reading it.
 
 ### Local (k3s) development
 
@@ -52,6 +66,7 @@ Cluster setup, ports and troubleshooting are in
 | Topic | Doc |
 |---|---|
 | Signup, roles, `POST /api/auth/register` | `0to1-agents-market/docs/user-registration.md` |
+| Organizations, roles, profile isolation | `0to1-agents-market/docs/organizations-and-roles.md` |
 | Keycloak realm import, client secrets, reset script | `0to1-agents-market/docs/keycloak-realm.md` |
 | Verification email (SES) | `0to1-agents-market/docs/ses-email.md` |
 | Token → LiteLLM key chain (why the `basic` scope matters) | `0to1-agents-market/docs/litellm-key-resolution.md` |
