@@ -37,7 +37,9 @@ Role-based access:
   Only users with the realm role "agent_producer", "platform_developer" or
   "platform_admin" — or the org role admin/producer in some organization — may
   access the Langflow builder.  Everyone else is signed back out of Keycloak
-  and returned to /login with an access-denied message.
+  and returned to /login with an access-denied message.  An account that has
+  picked no role at all yet is instead sent to the marketplace's /onboarding
+  screen, which is the place that can fix it.
 
 Organization profiles:
   A user acts either personally or inside one organization, and each profile is
@@ -87,6 +89,14 @@ _PLACEHOLDER_SECRET = "REPLACE_WITH_CLIENT_SECRET"
 
 # Realm roles that are allowed to access the Langflow builder personally.
 _ALLOWED_ROLES = {"agent_producer", "platform_admin", "platform_developer"}
+
+# Every realm role this platform assigns. A token carrying none of them belongs
+# to an account that hasn't picked a role yet, which is a different problem from
+# being denied — see oidc_callback.
+_KNOWN_REALM_ROLES = _ALLOWED_ROLES | {
+    "agent_consumer",
+    "platform_reviewer",
+}
 
 # Org roles that are allowed to access the builder under that org's profile.
 _ORG_BUILDER_ROLES = {"admin", "producer"}
@@ -747,6 +757,14 @@ async def oidc_callback(
     profiles = builder_profiles(realm_roles, orgs)
     requested_org = (state_data.get("org_id") or "") or None
     denied = not profiles or (requested_org is not None and requested_org not in profiles)
+
+    # An account that has picked no role yet isn't denied, it's unfinished —
+    # send it to the marketplace onboarding screen, keeping the Keycloak
+    # session so the user doesn't have to sign in twice.
+    if denied and not realm_roles.intersection(_KNOWN_REALM_ROLES):
+        base = os.getenv("AGENTS_MARKET_FRONTEND_URL", "http://localhost:3001").rstrip("/")
+        return RedirectResponse(url=f"{base}/onboarding", status_code=302)
+
     if denied:
         error_msg = (
             f"Access denied: your account has no producer role in '{requested_org}'."
