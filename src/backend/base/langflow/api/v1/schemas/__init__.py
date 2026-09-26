@@ -343,6 +343,12 @@ class VerticesBuiltResponse(BaseModel):
     vertices: list[VertexBuildResponse]
 
 
+class HistoryMessage(BaseModel):
+    role: Literal["user", "agent"]
+    text: str
+    timestamp: datetime
+
+
 class SimplifiedAPIRequest(BaseModel):
     input_value: str | None = Field(default=None, description="The input value")
     input_type: InputType | None = Field(default="chat", description="The input type")
@@ -353,6 +359,13 @@ class SimplifiedAPIRequest(BaseModel):
     )
     tweaks: Tweaks | None = Field(default=None, description="The tweaks")
     session_id: str | None = Field(default=None, description="The session id")
+    history: list[HistoryMessage] | None = Field(
+        default=None,
+        description=(
+            "Prior conversation for session_id. When set, it replaces the session's stored messages "
+            "for this run, and the session's messages are deleted when the run ends."
+        ),
+    )
 
 
 # (alias) type ReactFlowJsonObject<NodeData = any, EdgeData = any> = {

@@ -26,6 +26,12 @@ from lfx.interface.components import component_cache
 from lfx.log.logger import logger
 from lfx.schema.schema import InputValueRequest
 from lfx.services.settings.service import SettingsService
+from lfx.utils.constants import (
+    MESSAGE_SENDER_AI,
+    MESSAGE_SENDER_NAME_AI,
+    MESSAGE_SENDER_NAME_USER,
+    MESSAGE_SENDER_USER,
+)
 from lfx.utils.flow_validation import (
     CustomComponentValidationError,
     code_hash_matches_any_template,
@@ -39,6 +45,7 @@ from langflow.api.v1.schemas import (
     ConfigResponse,
     CustomComponentRequest,
     CustomComponentResponse,
+    HistoryMessage,
     PublicConfigResponse,
     RunResponse,
     SimplifiedAPIRequest,
@@ -51,8 +58,10 @@ from langflow.exceptions.api import APIException, InvalidChatInputError
 from langflow.exceptions.serialization import SerializationError
 from langflow.helpers.flow import get_flow_by_id_or_endpoint_name
 from langflow.interface.initialize.loading import update_params_with_load_from_db_fields
+from langflow.memory import aadd_messages, adelete_messages
 from langflow.processing.process import process_tweaks, run_graph_internal
 from langflow.schema.graph import Tweaks
+from langflow.schema.message import Message
 from langflow.services.auth.utils import (
     api_key_security,
     get_current_active_user,
@@ -150,6 +159,26 @@ def validate_input_and_tweaks(input_request: SimplifiedAPIRequest) -> None:
             raise InvalidChatInputError(msg)
 
 
+async def _load_session_history(session_id: str, flow_id: str, history: list[HistoryMessage]) -> None:
+    """Replace the session's stored messages with the caller's history, so memory components read it."""
+    await adelete_messages(session_id=session_id)
+    if not history:
+        return
+    await aadd_messages(
+        [
+            Message(
+                text=item.text,
+                sender=MESSAGE_SENDER_USER if item.role == "user" else MESSAGE_SENDER_AI,
+                sender_name=MESSAGE_SENDER_NAME_USER if item.role == "user" else MESSAGE_SENDER_NAME_AI,
+                session_id=session_id,
+                timestamp=item.timestamp,
+            )
+            for item in history
+        ],
+        flow_id=flow_id,
+    )
+
+
 async def simple_run_flow(
     flow: Flow,
     input_request: SimplifiedAPIRequest,
@@ -160,7 +189,13 @@ async def simple_run_flow(
     context: dict | None = None,
     run_id: str | None = None,
 ):
+    """Run a flow to completion; with stream=True, tokens are pushed through event_manager as it runs.
+
+    When the request carries `history`, the caller owns the conversation: the session's messages exist
+    only for this run and are deleted afterwards, so the container keeps no chat history between runs.
+    """
     validate_input_and_tweaks(input_request)
+    caller_owns_history = input_request.history is not None and bool(input_request.session_id)
     try:
         task_result: list[RunOutputs] = []
         user_id = api_key_user.id if api_key_user else None
@@ -197,6 +232,8 @@ async def simple_run_flow(
                     and (input_request.output_type == "any" or input_request.output_type in vertex.id.lower())  # type: ignore[operator]
                 )
             ]
+        if caller_owns_history:
+            await _load_session_history(input_request.session_id, flow_id_str, input_request.history)
         task_result, session_id = await run_graph_internal(
             graph=graph,
             flow_id=flow_id_str,
@@ -211,6 +248,9 @@ async def simple_run_flow(
 
     except sa.exc.StatementError as exc:
         raise ValueError(str(exc)) from exc
+    finally:
+        if caller_owns_history:
+            await adelete_messages(session_id=input_request.session_id)
 
 
 def _get_vertex_ids_from_flow(flow: Flow) -> list[str]:
