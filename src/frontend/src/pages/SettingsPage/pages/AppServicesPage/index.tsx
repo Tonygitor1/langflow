@@ -211,7 +211,14 @@ export default function AppServicesPage() {
           </DialogHeader>
           <div className="flex gap-2">
             {(["image", "url"] as const).map((m) => (
-              <Button key={m} variant={mode === m ? "primary" : "outline"} size="sm" onClick={() => setMode(m)}>
+              <Button
+                key={m}
+                variant={mode === m ? "default" : "outline"}
+                size="sm"
+                onClick={() => setMode(m)}
+                data-testid={`app-service-mode-${m}`}
+                aria-pressed={mode === m}
+              >
                 {m === "image" ? "Container image" : "API endpoint"}
               </Button>
             ))}

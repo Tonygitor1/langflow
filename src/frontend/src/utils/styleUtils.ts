@@ -326,6 +326,7 @@ export const SIDEBAR_CATEGORIES = [
     name: "utilities",
     icon: "Wand2",
   },
+  { display_name: "Agent Apps", name: "agents_market", icon: "LayoutDashboard" },
   {
     display_name: "sidebar.category.prototypes",
     name: "prototypes",
