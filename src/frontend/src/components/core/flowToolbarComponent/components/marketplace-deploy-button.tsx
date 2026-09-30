@@ -5,14 +5,20 @@ import { useGetDeploymentStatus } from "@/controllers/API/queries/flows/use-get-
 import {
   usePostDeployMarketplace,
   type A2AConfig,
+  type DeployMarketplaceResponse,
 } from "@/controllers/API/queries/flows/use-post-deploy-marketplace";
 import useAlertStore from "@/stores/alertStore";
+import useFlowStore from "@/stores/flowStore";
 import useFlowsManagerStore from "@/stores/flowsManagerStore";
 import A2aConfigModal from "@/modals/a2aConfigModal";
 
 export default function MarketplaceDeployButton() {
   const currentFlow = useFlowsManagerStore((s) => s.currentFlow);
   const flowId = currentFlow?.id;
+  // Mirrors is_app_flow() in api/v1/agent_apps.py; read the live canvas, not the saved flow.
+  const isAppFlow = useFlowStore((s) =>
+    s.nodes.some((n) => n.data?.type === "AgentAppSkeleton"),
+  );
   const [showA2aModal, setShowA2aModal] = useState(false);
   const setSuccessData = useAlertStore((s) => s.setSuccessData);
   const setErrorData = useAlertStore((s) => s.setErrorData);
@@ -25,9 +31,11 @@ export default function MarketplaceDeployButton() {
     // Non-blocking: the executor now returns immediately with status
     // "starting". We just confirm the request landed, close the modal, and let
     // the header status indicator poll readiness in the background.
-    onSuccess: () => {
+    onSuccess: (result?: DeployMarketplaceResponse) => {
       setShowA2aModal(false);
-      setSuccessData({ title: "Deployment started" });
+      setSuccessData({
+        title: result?.unchanged ? "No changes: the published app is already up to date" : "Deployment started",
+      });
       if (flowId) {
         queryClient.invalidateQueries({
           queryKey: ["useGetDeploymentStatus", flowId],
@@ -77,6 +85,7 @@ export default function MarketplaceDeployButton() {
         isPending={isPending}
         initialConfig={deploymentStatus?.a2a_config}
         deploymentStatus={deploymentStatus}
+        appMode={isAppFlow}
       />
     </>
   );

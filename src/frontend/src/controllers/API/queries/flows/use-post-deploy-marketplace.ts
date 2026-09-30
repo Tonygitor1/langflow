@@ -34,9 +34,12 @@ interface IDeployMarketplace {
 
 export interface DeployMarketplaceResponse {
   agent_id: string;
-  container_url: string;
+  container_url: string | null;
   status: string;
   flow_id: string;
+  kind?: "app";
+  /** App flows only: the manifest matched the running app, so nothing was redeployed. */
+  unchanged?: boolean;
 }
 
 export const usePostDeployMarketplace: useMutationFunctionType<
