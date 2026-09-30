@@ -10,6 +10,7 @@ if TYPE_CHECKING:
         FAISS,
         Notion,
         agentql,
+        agents_market,
         aiml,
         altk,
         amazon,
@@ -113,6 +114,7 @@ if TYPE_CHECKING:
 _dynamic_imports = {
     # Category modules (existing functionality)
     "agentql": "__module__",
+    "agents_market": "__module__",
     "aiml": "__module__",
     "altk": "__module__",
     "amazon": "__module__",
@@ -246,6 +248,7 @@ __all__ = [
     "FAISS",
     "Notion",
     "agentql",
+    "agents_market",
     "aiml",
     "altk",
     "amazon",

@@ -27,6 +27,7 @@ from langflow.api.utils import (
     validate_is_component,
 )
 from langflow.api.utils.zip_utils import extract_flows_from_zip
+from langflow.api.v1.agent_apps import AppFlowError, app_publish_body, is_app_flow, problems_message
 from langflow.api.v1.flows_helpers import (
     _build_flows_download_response,
     _get_safe_flow_path,
@@ -675,6 +676,8 @@ async def deploy_to_marketplace(
     # The builder session already fixes the profile, so the org comes off the
     # username rather than a client-supplied header — the two can't disagree.
     owner_email, org_id = split_scoped_username(current_user.username)
+    if is_app_flow(flow.data):
+        return await _publish_agent_app(flow.data, flow_id, body, current_user.username)
     payload = {
         "agent_id": str(flow_id),
         # Forward the producer's email as the deployment owner. In this
@@ -710,6 +713,30 @@ async def deploy_to_marketplace(
         raise HTTPException(status_code=resp.status_code, detail=resp.text[:500])
 
     return resp.json()
+
+
+async def _publish_agent_app(graph: dict, flow_id: UUID, body: DeployMarketplaceBody, scoped_username: str) -> dict:
+    """Agent App flows publish to the marketplace's app path; no Langflow runs in their pod."""
+    from lfx.components.agents_market._marketplace import MarketplaceError, call, headers_for
+
+    try:
+        payload = app_publish_body(graph, flow_id=str(flow_id), a2a_config=body.a2a_config.model_dump())
+    except AppFlowError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    try:
+        result = await call(headers_for(scoped_username), "POST", "/api/apps/publish", payload)
+    except MarketplaceError as exc:
+        raise HTTPException(status_code=exc.status, detail=problems_message(exc.detail)) from exc
+    except httpx.HTTPError as exc:
+        raise HTTPException(status_code=502, detail=f"marketplace unreachable: {exc}") from exc
+    return {
+        "agent_id": result["agentId"],
+        "container_url": None,
+        "status": result["status"],
+        "flow_id": str(flow_id),
+        "kind": "app",
+        "unchanged": result.get("unchanged", False),
+    }
 
 
 @router.get("/{flow_id}/deployment-status", status_code=200)

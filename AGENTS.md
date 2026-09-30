@@ -61,6 +61,25 @@ cannot do uv's atomic renames, and not in `/tmp`, which is wiped on restart.
 Cluster setup, ports and troubleshooting are in
 `0to1-agents-market/deployment/local/LOCAL_DEV.md`.
 
+### Agents Market component pack (Agent Apps)
+
+`src/lfx/src/lfx/components/agents_market/` is fork-only. It builds an
+**Agent App**: an agent with screens instead of a chat box. Three nodes, wired
+`Agent User Store → Agent App Query → Agent App Skeleton`:
+
+- **Agent User Store**: the per-user data namespaces (mark `sensitive` ones).
+- **Agent App Query**: picks an App Service (Settings → App Services) and sets the
+  price cap of each paid intent.
+- **Agent App Skeleton**: the screens (JSON). Building it runs the same contract
+  check Publish does, via the marketplace.
+
+Publish (`api/v1/agent_apps.py`) sends these to the marketplace's
+`/api/apps/publish`. The runtime pod has **no Langflow**, so unlike chat agents
+there is no flow-runtime image to rebuild; the builder picks component changes
+up on restart. The nodes and `api/v1/app_services.py` call the marketplace as the
+signed-in producer (internal key + profile from the session). See
+`0to1-agents-market/docs/agent-apps.md`.
+
 ### Sibling-repo docs
 
 | Topic | Doc |
@@ -71,6 +90,7 @@ Cluster setup, ports and troubleshooting are in
 | Verification email (SES) | `0to1-agents-market/docs/ses-email.md` |
 | Token → LiteLLM key chain (why the `basic` scope matters) | `0to1-agents-market/docs/litellm-key-resolution.md` |
 | Publish → deploy pipeline | `0to1-agents-market/docs/publish-deploy-ux.md` |
+| Agent Apps: services, publish, runtime | `0to1-agents-market/docs/agent-apps.md`, `agent-runtime.md` |
 
 ## Prerequisites
 

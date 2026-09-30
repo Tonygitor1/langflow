@@ -51,6 +51,16 @@ export default function SettingsPage(): JSX.Element {
       ),
     },
     {
+      title: "App Services",
+      href: "/settings/app-services",
+      icon: (
+        <ForwardedIconComponent
+          name="Server"
+          className="w-4 flex-shrink-0 justify-start stroke-[1.5]"
+        />
+      ),
+    },
+    {
       title: "Langflow MCP Client",
       href: "/settings/mcp-client",
       icon: (
