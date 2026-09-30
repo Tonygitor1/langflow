@@ -61,6 +61,14 @@ cannot do uv's atomic renames, and not in `/tmp`, which is wiped on restart.
 Cluster setup, ports and troubleshooting are in
 `0to1-agents-market/deployment/local/LOCAL_DEV.md`.
 
+### Definition of done — verify end to end before handing over
+
+Before saying a change works: run its tests **and** check it live — terminal
+(pods, logs, the e2e suites in `0to1-agents-market/tests/e2e/`) and the browser
+(open the changed page or flow at `localhost:3000` and walk the user path).
+Flows made through the API must also open in the canvas. See the full rule in
+`0to1-agents-market/CLAUDE.md` ("Definition of done").
+
 ### Agents Market component pack (Agent Apps)
 
 `src/lfx/src/lfx/components/agents_market/` is fork-only. It builds an
