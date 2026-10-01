@@ -8,15 +8,24 @@ if TYPE_CHECKING:
     from lfx.components.agents_market.agent_app_query import AgentAppQueryComponent
     from lfx.components.agents_market.agent_app_skeleton import AgentAppSkeletonComponent
     from lfx.components.agents_market.agent_user_store import AgentUserStoreComponent
+    from lfx.components.agents_market.news_sources import AgentAppNewsSourcesComponent
+    from lfx.components.agents_market.price_source import AgentAppPriceSourceComponent
+    from lfx.components.agents_market.research_documents import AgentAppResearchDocumentsComponent
 
 _dynamic_imports = {
     "AgentAppQueryComponent": "agent_app_query",
     "AgentAppSkeletonComponent": "agent_app_skeleton",
     "AgentUserStoreComponent": "agent_user_store",
+    "AgentAppPriceSourceComponent": "price_source",
+    "AgentAppNewsSourcesComponent": "news_sources",
+    "AgentAppResearchDocumentsComponent": "research_documents",
 }
 
 __all__ = [
+    "AgentAppNewsSourcesComponent",
+    "AgentAppPriceSourceComponent",
     "AgentAppQueryComponent",
+    "AgentAppResearchDocumentsComponent",
     "AgentAppSkeletonComponent",
     "AgentUserStoreComponent",
 ]

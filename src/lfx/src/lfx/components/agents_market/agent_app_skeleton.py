@@ -87,6 +87,7 @@ class AgentAppSkeletonComponent(Component):
                     "store": query.get("store") or {},
                     "caps": query.get("caps") or {},
                     "default_cap": query.get("default_cap") or 0,
+                    "sources": query.get("sources") or {},
                 },
             )
         except MarketplaceError as exc:
@@ -112,6 +113,7 @@ class AgentAppSkeletonComponent(Component):
                 "store": query.get("store") or {},
                 "caps": query.get("caps") or {},
                 "default_cap": query.get("default_cap") or 0,
+                "sources": query.get("sources") or {},
                 "check": report,
             }
         )

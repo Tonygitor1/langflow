@@ -46,6 +46,13 @@ class AgentAppQueryComponent(Component):
             info="Connect an Agent User Store.",
             required=False,
         ),
+        DataInput(
+            name="sources",
+            display_name="Data sources",
+            info="Connect Price Source, News Sources or Research Documents nodes: what users may pick from.",
+            required=False,
+            is_list=True,
+        ),
         IntInput(
             name="default_cap",
             display_name="Default cap",
@@ -145,6 +152,8 @@ class AgentAppQueryComponent(Component):
             msg = f"App Service '{svc['name']}' is not verified: {svc.get('verificationError')}"
             raise ValueError(msg)
         caps, problems = self._caps(svc["manifest"])
+        sources, more = self._sources()
+        problems += more
         if problems:
             raise ValueError("; ".join(problems))
         store = (self.store.data if isinstance(self.store, Data) else self.store) or {"namespaces": {}}
@@ -156,5 +165,21 @@ class AgentAppQueryComponent(Component):
                 "caps": caps,
                 "default_cap": int(self.default_cap or 0),
                 "store": store,
+                "sources": sources,
             }
         )
+
+    def _sources(self) -> tuple[dict[str, dict], list[str]]:
+        connected = self.sources if isinstance(self.sources, list) else [self.sources] if self.sources else []
+        sources: dict[str, dict] = {}
+        problems = []
+        for item in connected:
+            data = item.data if isinstance(item, Data) else item
+            category = (data or {}).get("category")
+            if not category:
+                continue
+            if category in sources:
+                problems.append(f"two nodes offer {category}; keep one")
+                continue
+            sources[category] = data["slot"]
+        return sources, problems

@@ -12,6 +12,12 @@ import json
 from typing import Any
 
 SKELETON, QUERY, STORE = "AgentAppSkeleton", "AgentAppQuery", "AgentUserStore"
+# Source node type -> the data category it offers.
+SOURCES = {
+    "AgentAppPriceSource": "market.prices",
+    "AgentAppNewsSources": "news",
+    "AgentAppResearchDocuments": "research.documents",
+}
 
 
 class AppFlowError(ValueError):
@@ -67,6 +73,27 @@ def _caps(node: dict) -> dict[str, int | None]:
     return caps
 
 
+def _sources(graph: dict, query_node: dict) -> dict[str, dict]:
+    """Each source node linked to Query -> {category: {options, default, label?}}."""
+    sources: dict[str, dict] = {}
+    for node_type, category in SOURCES.items():
+        for node in _nodes(graph, node_type):
+            if not _linked(graph, node, query_node):
+                continue
+            if category in sources:
+                msg = f"two nodes offer {category}; keep one"
+                raise AppFlowError(msg)
+            slot: dict[str, Any] = {
+                "options": [str(o) for o in _value(node, "options", []) or []],
+                "default": [str(d) for d in _value(node, "default", []) or []],
+            }
+            label = str(_value(node, "label", "") or "").strip()
+            if label:
+                slot["label"] = label[:80]
+            sources[category] = slot
+    return sources
+
+
 def app_publish_body(graph: dict, *, flow_id: str, a2a_config: dict) -> dict:
     """The marketplace's POST /api/apps/publish body for an Agent App flow."""
     from lfx.components.agents_market._marketplace import service_id_of
@@ -105,6 +132,7 @@ def app_publish_body(graph: dict, *, flow_id: str, a2a_config: dict) -> dict:
         "store": _store(store_node),
         "caps": _caps(query_node),
         "default_cap": int(_value(query_node, "default_cap", 0) or 0),
+        "sources": _sources(graph, query_node),
     }
 
 

@@ -81,3 +81,22 @@ def test_a_linked_studio_draft_replaces_the_json():
     graph["nodes"][0]["data"]["node"]["template"]["draft_id"] = {"value": "d-1"}
     body = app_publish_body(graph, flow_id="f", a2a_config={})
     assert body["draft_id"] == "d-1" and "skeleton" not in body
+
+
+def test_source_nodes_linked_to_query_become_the_apps_offer():
+    graph = _graph()
+    graph["nodes"] += [
+        _node("p", "AgentAppPriceSource", options=["ds-tradingadvisor", "yahoo-finance"], default=["ds-tradingadvisor"]),
+        _node("n", "AgentAppNewsSources", options=["cafef", "vnexpress"], default=["cafef"], label="Tin tức"),
+        _node("loose", "AgentAppResearchDocuments", options=["google-drive"], default=[]),
+    ]
+    graph["edges"] += [{"source": "p", "target": "q"}, {"source": "n", "target": "q"}]
+    body = app_publish_body(graph, flow_id="f", a2a_config={})
+    assert body["sources"] == {
+        "market.prices": {"options": ["ds-tradingadvisor", "yahoo-finance"], "default": ["ds-tradingadvisor"]},
+        "news": {"options": ["cafef", "vnexpress"], "default": ["cafef"], "label": "Tin tức"},
+    }
+    graph["nodes"].append(_node("p2", "AgentAppPriceSource", options=["sample"], default=["sample"]))
+    graph["edges"].append({"source": "p2", "target": "q"})
+    with pytest.raises(AppFlowError, match="two nodes offer market.prices"):
+        app_publish_body(graph, flow_id="f", a2a_config={})
