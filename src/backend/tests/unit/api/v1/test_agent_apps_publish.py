@@ -74,3 +74,10 @@ def test_store_is_optional():
     body = app_publish_body(_graph(store=False), flow_id="f", a2a_config={})
     assert body["store"] == {"namespaces": {}}
     assert json.dumps(body)
+
+
+def test_a_linked_studio_draft_replaces_the_json():
+    graph = _graph(skeleton="{not json")
+    graph["nodes"][0]["data"]["node"]["template"]["draft_id"] = {"value": "d-1"}
+    body = app_publish_body(graph, flow_id="f", a2a_config={})
+    assert body["draft_id"] == "d-1" and "skeleton" not in body

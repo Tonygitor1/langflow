@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import io
+import json
 import logging
 import os
 import threading
@@ -736,7 +737,57 @@ async def _publish_agent_app(graph: dict, flow_id: UUID, body: DeployMarketplace
         "flow_id": str(flow_id),
         "kind": "app",
         "unchanged": result.get("unchanged", False),
+        "translation_warnings": result.get("translationWarnings", []),
     }
+
+
+class StudioDraftBody(BaseModel):
+    """The Agent App Skeleton node as it is on the canvas right now (it may not be saved yet)."""
+
+    skeleton: str | None = None
+    service: str | None = None
+    draft_id: str | None = None
+
+
+@router.post("/{flow_id}/studio-draft", status_code=200)
+async def open_studio_draft(
+    *,
+    session: DbSession,
+    flow_id: UUID,
+    current_user: CurrentActiveUser,
+    body: StudioDraftBody,
+):
+    """The Studio draft for this app's screens: the linked one, or a new one seeded from the node."""
+    from lfx.components.agents_market._marketplace import MarketplaceError, call, headers_for, service_id_of
+
+    flow = await _read_flow(session, flow_id, current_user.id)
+    if flow is None:
+        raise HTTPException(status_code=404, detail="Flow not found")
+    headers = headers_for(current_user.username)
+    ui = os.getenv("AGENTS_MARKET_UI_URL", "http://localhost:3001").rstrip("/")
+    try:
+        if body.draft_id:
+            try:
+                draft = await call(headers, "GET", f"/api/app-drafts/{body.draft_id}")
+                return {"draft_id": draft["id"], "url": f"{ui}/studio/apps/{draft['id']}"}
+            except MarketplaceError as exc:
+                if exc.status != 404:
+                    raise
+        try:
+            skeleton = json.loads(body.skeleton or "")
+        except json.JSONDecodeError:
+            skeleton = None
+        draft = await call(headers, "POST", "/api/app-drafts", {
+            "title": flow.name,
+            "skeleton": skeleton if isinstance(skeleton, dict) else None,
+            "service_id": service_id_of(body.service) or None,
+            "flow_id": str(flow_id),
+        })
+    except MarketplaceError as exc:
+        raise HTTPException(status_code=exc.status, detail=problems_message(exc.detail)) from exc
+    except httpx.HTTPError as exc:
+        raise HTTPException(status_code=502, detail=f"marketplace unreachable: {exc}") from exc
+    return {"draft_id": draft["id"], "url": f"{ui}/studio/apps/{draft['id']}"}
 
 
 @router.get("/{flow_id}/deployment-status", status_code=200)

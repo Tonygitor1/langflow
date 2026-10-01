@@ -91,11 +91,8 @@ def app_publish_body(graph: dict, *, flow_id: str, a2a_config: dict) -> dict:
     if not service_id:
         msg = "pick an App Service in Agent App Query"
         raise AppFlowError(msg)
-    try:
-        skeleton = json.loads(_value(skeleton_node, "skeleton") or "")
-    except json.JSONDecodeError as exc:
-        msg = f"the skeleton is not valid JSON: {exc.msg} (line {exc.lineno})"
-        raise AppFlowError(msg) from exc
+    draft_id = str(_value(skeleton_node, "draft_id") or "").strip()
+    body: dict[str, Any] = {"draft_id": draft_id} if draft_id else {"skeleton": _skeleton(skeleton_node)}
 
     return {
         "agent_id": flow_id,
@@ -104,11 +101,19 @@ def app_publish_body(graph: dict, *, flow_id: str, a2a_config: dict) -> dict:
         "description": a2a_config.get("description") or "",
         "version": a2a_config.get("version") or "1.0.0",
         "service_id": service_id,
-        "skeleton": skeleton,
+        **body,
         "store": _store(store_node),
         "caps": _caps(query_node),
         "default_cap": int(_value(query_node, "default_cap", 0) or 0),
     }
+
+
+def _skeleton(node: dict) -> dict:
+    try:
+        return json.loads(_value(node, "skeleton") or "")
+    except json.JSONDecodeError as exc:
+        msg = f"the skeleton is not valid JSON: {exc.msg} (line {exc.lineno})"
+        raise AppFlowError(msg) from exc
 
 
 def problems_message(detail: Any) -> str:

@@ -40,6 +40,8 @@ export interface DeployMarketplaceResponse {
   kind?: "app";
   /** App flows only: the manifest matched the running app, so nothing was redeployed. */
   unchanged?: boolean;
+  /** App flows only: screen text that could not be translated at Publish. */
+  translation_warnings?: string[];
 }
 
 export const usePostDeployMarketplace: useMutationFunctionType<
